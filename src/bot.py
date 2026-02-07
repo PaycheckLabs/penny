@@ -13,7 +13,7 @@ from telegram.ext import (
 from openai import OpenAI
 
 # -----------------------------
-# Config / Setup
+# Logging
 # -----------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -21,9 +21,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# -----------------------------
+# Env / Config
+# -----------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # change if you want
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+PENNY_TEST_CHAT_ID = int(os.getenv("PENNY_TEST_CHAT_ID", "0"))
+
+# Comma-separated numeric Telegram user IDs, e.g. "123456789,987654321"
+ADMIN_USER_IDS = set(
+    int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()
+)
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var.")
@@ -34,27 +44,76 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 SYSTEM_PROMPT = (
     "You are Penny, an AI virtual assistant created by Paycheck Labs. "
-    "Be conversational, clear, and helpful. Keep answers concise, "
-    "ask a brief follow-up question only when needed."
+    "Be conversational, clear, and helpful. Keep answers clean and concise. "
+    "Ask a short follow-up question only when needed."
 )
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def is_admin(update: Update) -> bool:
+    uid = update.effective_user.id if update.effective_user else None
+    return uid in ADMIN_USER_IDS
+
 
 # -----------------------------
 # Commands
 # -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Hi, I'm Penny. What can I help you with today?"
-    )
+    await update.message.reply_text("Hi, I'm Penny. What can I help you with today?")
 
-# ✅ Temporary utility command: use this in your testing group to get the chat ID
+# Utility: run in a group to get the chat id (safe to delete later)
 async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
-    await update.message.reply_text(
-        f"chat.id = {chat.id}\nchat.type = {chat.type}"
-    )
+    await update.message.reply_text(f"chat.id = {chat.id}\nchat.type = {chat.type}")
+
+# Admin-only: post an image + caption into the Penny Testing Chat
+# Run this in DM with Penny (or a private admin group) so it doesn't appear in the public chat.
+#
+# Usage:
+#   /posttest https://example.com/image.png | Your caption text
+async def posttest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    # Only admins can trigger this
+    if not is_admin(update):
+        return
+
+    if PENNY_TEST_CHAT_ID == 0:
+        await update.message.reply_text("Missing PENNY_TEST_CHAT_ID env var.")
+        return
+
+    raw = update.message.text or ""
+    payload = raw.replace("/posttest", "", 1).strip()
+
+    if not payload:
+        await update.message.reply_text("Usage: /posttest <image_url> | <caption>")
+        return
+
+    parts = [p.strip() for p in payload.split("|", 1)]
+    image_url = parts[0]
+    caption = parts[1] if len(parts) > 1 else ""
+
+    if not image_url.startswith("http"):
+        await update.message.reply_text("Image must be a public http(s) URL.")
+        return
+
+    try:
+        await context.bot.send_photo(
+            chat_id=PENNY_TEST_CHAT_ID,
+            photo=image_url,
+            caption=caption,
+        )
+        # Extra polish: silent success (no confirmation message)
+        return
+    except Exception:
+        logger.exception("Failed to post image to testing chat")
+        await update.message.reply_text("Failed to post. Check logs.")
+
 
 # -----------------------------
-# Message Handler (ChatGPT)
+# Normal message handler (OpenAI)
 # -----------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
@@ -62,7 +121,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_text = update.message.text.strip()
 
-    # Ignore commands here (they're handled by CommandHandlers)
+    # Let command handlers deal with commands
     if user_text.startswith("/"):
         return
 
@@ -75,15 +134,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ],
             temperature=0.7,
         )
-
         reply = resp.choices[0].message.content.strip()
         await update.message.reply_text(reply)
-
-    except Exception as e:
+    except Exception:
         logger.exception("Error calling OpenAI")
         await update.message.reply_text(
             "I hit an error calling the model. Check Railway logs and your OPENAI settings."
         )
+
 
 # -----------------------------
 # Main
@@ -93,13 +151,15 @@ def main() -> None:
 
     # Commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("chatid", chatid))  # ✅ add this
+    app.add_handler(CommandHandler("chatid", chatid))
+    app.add_handler(CommandHandler("posttest", posttest))
 
     # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Penny bot started.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
