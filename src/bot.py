@@ -1,5 +1,6 @@
 import os
 import logging
+from typing import Dict, Optional
 
 from telegram import Update
 from telegram.ext import (
@@ -49,6 +50,12 @@ SYSTEM_PROMPT = (
 )
 
 # -----------------------------
+# In-memory state (per process)
+# Stores last uploaded photo file_id per admin user
+# -----------------------------
+LAST_PHOTO_FILE_ID_BY_USER: Dict[int, str] = {}
+
+# -----------------------------
 # Helpers
 # -----------------------------
 def is_admin(update: Update) -> bool:
@@ -67,16 +74,12 @@ async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     await update.message.reply_text(f"chat.id = {chat.id}\nchat.type = {chat.type}")
 
-# Admin-only: post an image + caption into the Penny Testing Chat
-# Run this in DM with Penny (or a private admin group) so it doesn't appear in the public chat.
-#
+# Admin-only: post an image URL + caption into the Penny Testing Chat
 # Usage:
 #   /posttest https://example.com/image.png | Your caption text
 async def posttest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-
-    # Only admins can trigger this
     if not is_admin(update):
         return
 
@@ -105,10 +108,67 @@ async def posttest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             photo=image_url,
             caption=caption,
         )
-        # Extra polish: silent success (no confirmation message)
+        # Silent success
         return
     except Exception:
-        logger.exception("Failed to post image to testing chat")
+        logger.exception("Failed to post image to testing chat (URL)")
+        await update.message.reply_text("Failed to post. Check logs.")
+
+# Admin-only: capture last photo you DM to Penny
+async def capture_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.photo:
+        return
+    if not is_admin(update):
+        return
+
+    user_id = update.effective_user.id
+    # Highest resolution photo is last in the list
+    file_id = update.message.photo[-1].file_id
+    LAST_PHOTO_FILE_ID_BY_USER[user_id] = file_id
+
+    # Extra polish: stay silent (or uncomment to confirm)
+    # await update.message.reply_text("Photo saved ✅")
+
+# Admin-only: repost your last uploaded photo to the testing chat with a caption
+# Workflow:
+#   1) Upload photo in Penny DM
+#   2) /posttestcaption Your caption here
+async def posttestcaption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_admin(update):
+        return
+
+    if PENNY_TEST_CHAT_ID == 0:
+        await update.message.reply_text("Missing PENNY_TEST_CHAT_ID env var.")
+        return
+
+    user_id = update.effective_user.id
+    file_id: Optional[str] = LAST_PHOTO_FILE_ID_BY_USER.get(user_id)
+
+    if not file_id:
+        await update.message.reply_text(
+            "I don’t have a recent photo from you yet.\n"
+            "Send me an image first (in this DM), then run:\n"
+            "/posttestcaption <caption>"
+        )
+        return
+
+    caption = (update.message.text or "").replace("/posttestcaption", "", 1).strip()
+    if not caption:
+        await update.message.reply_text("Usage: /posttestcaption <caption>")
+        return
+
+    try:
+        await context.bot.send_photo(
+            chat_id=PENNY_TEST_CHAT_ID,
+            photo=file_id,   # ✅ uses the exact uploaded Telegram photo
+            caption=caption,
+        )
+        # Silent success
+        return
+    except Exception:
+        logger.exception("Failed to post image to testing chat (file_id)")
         await update.message.reply_text("Failed to post. Check logs.")
 
 
@@ -153,6 +213,10 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(CommandHandler("posttest", posttest))
+    app.add_handler(CommandHandler("posttestcaption", posttestcaption))
+
+    # Capture admin-uploaded photos in DM (or anywhere Penny receives photos)
+    app.add_handler(MessageHandler(filters.PHOTO, capture_photo))
 
     # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
