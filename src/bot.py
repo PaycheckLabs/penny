@@ -12,71 +12,45 @@ from telegram.ext import (
 
 from openai import OpenAI
 
-# -------------------------
-# Basic setup
-# -------------------------
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("penny")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano").strip()
-OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "300"))
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# --- OpenAI client (reads OPENAI_API_KEY from env) ---
+def get_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    return OpenAI(api_key=api_key)
+
 
 SYSTEM_PROMPT = (
     "You are Penny, the official AI advisor for Paycheck Labs.\n"
-    "Tone: calm, precise, helpful.\n"
-    "Priority: clarity and correct process over hype.\n"
-    "If you are unsure, say so and ask one short follow-up question.\n"
+    "Be calm, precise, and protective. Prioritize clarity and correct process over hype.\n"
+    "If you are unsure, ask a short follow-up question.\n"
 )
 
-# -------------------------
-# Commands
-# -------------------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hello. I’m Penny, the AI advisor for Paycheck Labs.\n\n"
-        "Try /help or ask me anything."
+        "Try:\n"
+        "- /help\n"
+        '- "What can you do?"\n'
+        '- "Summarize Paycheck Labs in 3 bullets"'
     )
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Available commands:\n"
-        "/start\n"
-        "/help\n\n"
-        "You can also just type a question."
+        "Commands:\n"
+        "/start - Introduction\n"
+        "/help - This message\n\n"
+        "You can also just type your question normally."
     )
 
-# -------------------------
-# OpenAI call
-# -------------------------
-def llm_reply(user_text: str) -> str:
-    if not client:
-        return "OpenAI is not configured yet. Set OPENAI_API_KEY in Railway variables."
 
-    # Responses API call (simple single-turn)
-    # Uses the model you set in OPENAI_MODEL, e.g. gpt-5-nano :contentReference[oaicite:1]{index=1}
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text},
-        ],
-        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
-        text={"verbosity": "low"},
-    )
-
-    # Pull text safely
-    try:
-        return resp.output_text.strip()
-    except Exception:
-        # Fallback if SDK shape changes
-        return "I ran into an issue generating a response. Try again."
-
-# -------------------------
-# Text handler
-# -------------------------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
@@ -95,28 +69,44 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if "what can you do" in lower or lower == "help":
+    if "help" in lower or lower == "what can you do":
         await update.message.reply_text(
             "Right now I can:\n"
             "- Answer questions\n"
-            "- Explain concepts clearly\n"
-            "- Help draft posts and docs\n"
-            "- Guide you through setup and testing"
+            "- Help you draft posts, docs, and announcements\n"
+            "- Guide you through setup and troubleshooting\n\n"
+            "Tell me what you want and I’ll respond."
         )
         return
 
-    # Default: send to OpenAI
+    # --- LLM call ---
     try:
-        answer = llm_reply(text)
-        await update.message.reply_text(answer)
-    except Exception as e:
-        logger.exception("LLM error: %s", e)
-        await update.message.reply_text(
-            "I hit an error calling the model. Check Railway logs and your OPENAI_API_KEY."
+        client = get_openai_client()
+
+        response = client.responses.create(
+            model="gpt-5-nano",  # forces nano (cost controlled here)
+            instructions=SYSTEM_PROMPT,
+            input=text,
         )
 
+        output = (response.output_text or "").strip()
+        if not output:
+            output = "I didn’t get a usable response back. Try again with a bit more detail."
+
+        await update.message.reply_text(output)
+
+    except Exception as e:
+        # Log full error for Railway logs
+        logger.exception("OpenAI call failed: %s", str(e))
+
+        # Safe user message
+        await update.message.reply_text(
+            "I hit an error calling the language model. Check Railway logs and your OPENAI_API_KEY."
+        )
+
+
 def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
 
@@ -124,12 +114,11 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-
-    # Reply to any non-command text messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Penny is running...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
