@@ -17,6 +17,9 @@ from telegram.ext import (
 
 from openai import OpenAI
 
+# NEW: welcome + hard gate module
+from welcome_gate import register_welcome_gate_handlers
+
 # -------------------------
 # Logging
 # -------------------------
@@ -258,6 +261,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # NEW: register welcome GIF + hard gate verification handlers
+    register_welcome_gate_handlers(app)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
