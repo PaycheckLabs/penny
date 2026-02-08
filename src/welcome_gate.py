@@ -31,7 +31,7 @@ PAYCHECK_MEDIUM = "https://medium.com/@paycheck"
 VERIFY_TIMEOUT_SECONDS = int(os.getenv("VERIFY_TIMEOUT_SECONDS", "180"))  # 3 minutes
 KICK_IF_NOT_VERIFIED = os.getenv("KICK_IF_NOT_VERIFIED", "true").lower() == "true"
 
-# Optional: wrong-attempt behavior
+# Wrong-attempt behavior
 CAPTCHA_MAX_ATTEMPTS = int(os.getenv("CAPTCHA_MAX_ATTEMPTS", "3"))
 KICK_ON_TOO_MANY_WRONG = os.getenv("KICK_ON_TOO_MANY_WRONG", "true").lower() == "true"
 
@@ -42,7 +42,7 @@ WELCOME_GIF_LOCAL_PATH = os.getenv("WELCOME_GIF_LOCAL_PATH", "").strip()
 # Callback prefix
 CB_VERIFY_PREFIX = "verify_gate:"  # keep short, callback_data has length limits
 
-# Captcha icons (simple and effective)
+# Captcha icons
 CAPTCHA_ICONS: List[str] = ["✅", "⭐", "🔷", "🍀"]
 
 
@@ -134,15 +134,19 @@ async def _kick_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_T
 
 
 def _welcome_caption(first_name: str, required_icon: str) -> str:
-    # Keep it short because GIF captions can be truncated
     return (
         f"Welcome, {first_name} 👋\n\n"
-        "Before you can chat, please verify.\n"
-        f"Tap the {required_icon} button below."
+        "I’m Penny. You’re in my testing group for Penny v1.1 by Paycheck Labs.\n\n"
+        f"Before you can chat, tap the {required_icon} button below.\n\n"
+        "Talk to me with:\n\n"
+        "▸ @HeyPennyBot\n"
+        "▸ /penny + your message\n"
+        "▸ Reply to one of my messages\n\n"
+        "Paycheck links are in the buttons below."
     )
 
 
-def _build_keyboard(chat_id: int, user_id: int, token: str, required_icon: str) -> InlineKeyboardMarkup:
+def _build_keyboard(chat_id: int, user_id: int, token: str) -> InlineKeyboardMarkup:
     # 1) Info links
     rows: List[List[InlineKeyboardButton]] = [
         [
@@ -247,7 +251,7 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 3) Send welcome GIF + links + captcha buttons
     caption = _welcome_caption(first_name, required_icon)
-    markup = _build_keyboard(chat_id, user_id, token, required_icon)
+    markup = _build_keyboard(chat_id, user_id, token)
 
     sent = None
     try:
@@ -388,7 +392,7 @@ async def on_verify_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         await query.edit_message_caption(
             caption=_welcome_caption(clicker.first_name or "there", required_icon),
-            reply_markup=_build_keyboard(chat_id, target_user_id, pv.token, required_icon),
+            reply_markup=_build_keyboard(chat_id, target_user_id, pv.token),
         )
     except Exception:
         pass
