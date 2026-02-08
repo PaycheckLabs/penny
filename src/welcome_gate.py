@@ -16,6 +16,7 @@ from telegram.ext import (
     ContextTypes,
     ChatMemberHandler,
     CallbackQueryHandler,
+    ChatJoinRequestHandler,
 )
 
 log = logging.getLogger(__name__)
@@ -39,8 +40,8 @@ KICK_ON_TOO_MANY_WRONG = os.getenv("KICK_ON_TOO_MANY_WRONG", "true").lower() == 
 WELCOME_GIF_FILE_ID = os.getenv("WELCOME_GIF_FILE_ID", "").strip()
 WELCOME_GIF_LOCAL_PATH = os.getenv("WELCOME_GIF_LOCAL_PATH", "").strip()
 
-# Callback prefix
-CB_VERIFY_PREFIX = "verify_gate:"  # keep short, callback_data has length limits
+# Callback prefix (keep short, callback_data has length limits)
+CB_VERIFY_PREFIX = "verify_gate:"
 
 # Captcha icons
 CAPTCHA_ICONS: List[str] = ["✅", "⭐", "🔷", "🍀"]
@@ -57,9 +58,10 @@ class PendingVerification:
     user_id: int
     created_at: float
     welcome_message_id: Optional[int] = None
-    token: str = ""                 # short per-user token
-    correct_index: int = 0          # which icon is correct
-    attempts: int = 0               # wrong attempts so far
+    token: str = ""          # short per-user token
+    correct_index: int = 0   # which icon is correct
+    attempts: int = 0        # wrong attempts so far
+
 
 PENDING: Dict[str, PendingVerification] = {}  # key: f"{chat_id}:{user_id}"
 
@@ -147,7 +149,6 @@ def _welcome_caption(first_name: str, required_icon: str) -> str:
 
 
 def _build_keyboard(chat_id: int, user_id: int, token: str) -> InlineKeyboardMarkup:
-    # 1) Info links
     rows: List[List[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton("Paycheck Website", url=PAYCHECK_WEBSITE),
@@ -158,10 +159,9 @@ def _build_keyboard(chat_id: int, user_id: int, token: str) -> InlineKeyboardMar
         ],
     ]
 
-    # 2) Captcha buttons (one row)
     captcha_buttons: List[InlineKeyboardButton] = []
     for idx, icon in enumerate(CAPTCHA_ICONS):
-        # callback_data format: verify_gate:<chat_id>:<user_id>:<token>:<choice_index>
+        # verify_gate:<chat_id>:<user_id>:<token>:<choice_index>
         cd = f"{CB_VERIFY_PREFIX}{chat_id}:{user_id}:{token}:{idx}"
         captcha_buttons.append(InlineKeyboardButton(icon, callback_data=cd))
 
@@ -185,8 +185,11 @@ async def _timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data or {}
     chat_id = data.get("chat_id")
     user_id = data.get("user_id")
-    k = _key(chat_id, user_id)
 
+    if chat_id is None or user_id is None:
+        return
+
+    k = _key(chat_id, user_id)
     pv = PENDING.get(k)
     if not pv:
         return
@@ -218,6 +221,30 @@ def _parse_callback(data: str) -> Optional[Tuple[int, int, str, int]]:
         return None
 
 
+# -----------------------------
+# NEW: Join request handler (private groups using invite links w/ approval)
+# -----------------------------
+async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    If the group uses 'Request to Join' invite links, approve the request.
+    After approval, Telegram typically emits a chat_member update, which triggers the normal welcome flow.
+    """
+    req = update.chat_join_request
+    if not req:
+        return
+
+    chat_id = req.chat.id
+    user_id = req.from_user.id
+
+    try:
+        await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
+    except Exception:
+        log.exception("Failed to approve join request for user %s in chat %s", user_id, chat_id)
+
+
+# -----------------------------
+# Main join flow (post-approval or direct joins)
+# -----------------------------
 async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     result = update.chat_member
     if not result:
@@ -231,6 +258,8 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     if user.is_bot:
         return
 
+    # Detect join:
+    # old: left/kicked -> new: member/restricted
     joined = (old.status in [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED]) and (
         new.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED]
     )
@@ -241,15 +270,15 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = user.id
     first_name = user.first_name or "there"
 
-    # 1) Restrict immediately
+    # 1) Restrict immediately (hard gate)
     await _apply_hard_gate(chat_id, user_id, context)
 
     # 2) Create captcha state
-    token = secrets.token_hex(4)  # short token, fits callback_data limits
+    token = secrets.token_hex(4)
     correct_index = secrets.randbelow(len(CAPTCHA_ICONS))
     required_icon = CAPTCHA_ICONS[correct_index]
 
-    # 3) Send welcome GIF + links + captcha buttons
+    # 3) Send welcome GIF + caption + buttons
     caption = _welcome_caption(first_name, required_icon)
     markup = _build_keyboard(chat_id, user_id, token)
 
@@ -381,14 +410,13 @@ async def on_verify_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             pass
         return
 
-    # Rotate challenge after wrong attempt (makes brute-force harder)
+    # Rotate challenge after wrong attempt
     pv.token = secrets.token_hex(4)
     pv.correct_index = secrets.randbelow(len(CAPTCHA_ICONS))
     required_icon = CAPTCHA_ICONS[pv.correct_index]
 
     await query.answer(f"Wrong button. Try again. Attempts left: {remaining}", show_alert=True)
 
-    # Update caption + refreshed keyboard with new token and requirement
     try:
         await query.edit_message_caption(
             caption=_welcome_caption(clicker.first_name or "there", required_icon),
@@ -399,5 +427,11 @@ async def on_verify_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 def register_welcome_gate_handlers(application) -> None:
+    # Join-request approval for private groups using invite links that require approval
+    application.add_handler(ChatJoinRequestHandler(on_join_request))
+
+    # Standard join flow
     application.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
+
+    # Captcha button clicks
     application.add_handler(CallbackQueryHandler(on_verify_captcha, pattern=f"^{CB_VERIFY_PREFIX}"))
