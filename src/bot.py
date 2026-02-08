@@ -1,9 +1,7 @@
 import os
-import re
-import time
 import logging
 from collections import defaultdict, deque
-from typing import Deque, Dict, List, Tuple, Optional
+from typing import Deque, Dict, Tuple, Optional
 
 from telegram import Update
 from telegram.ext import (
@@ -16,303 +14,219 @@ from telegram.ext import (
 
 from openai import OpenAI
 
-# -----------------------------
+# ---------------------------
 # Logging
-# -----------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("penny")
+# ---------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("penny-bot")
 
-# -----------------------------
-# Env
-# -----------------------------
+# ---------------------------
+# Env config
+# ---------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano").strip()
-OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "350"))
-ENV = os.getenv("ENV", "production").strip()
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "350").strip())
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+# Telegram username without "@"
+BOT_USERNAME = os.getenv("BOT_USERNAME", "HeyPennyBot").strip().lstrip("@")
+BOT_MENTION = f"@{BOT_USERNAME}"
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY not set")
+# ---------------------------
+# OpenAI client
+# ---------------------------
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# -----------------------------
-# Behavior settings
-# -----------------------------
-COMMAND_TRIGGER = "/penny"
-MENTION_TRIGGER_DEFAULT = "@HeyPennyBot"  # You can change later if you rename the bot
-MAX_TURNS = 10  # conversation memory size (per chat)
-
-# Chat memory:
-# chat_id -> deque of (role, content)
-CHAT_MEMORY: Dict[int, Deque[Tuple[str, str]]] = defaultdict(lambda: deque(maxlen=MAX_TURNS * 2))
-
-# -----------------------------
-# System prompt (style + scope)
-# -----------------------------
-SYSTEM_PREAMBLE = """You are Penny, a friendly general-purpose AI assistant.
+# ---------------------------
+# Behavior + style
+# ---------------------------
+SYSTEM_PREAMBLE = """
+You are Penny, a friendly general-purpose AI assistant.
 
 Style rules:
-- Sound human, warm, and concise.
-- Avoid em dashes. Use normal punctuation.
-- Default to short replies. Ask one helpful follow-up question when it makes sense.
-- If the user’s request is unclear, ask a brief clarifying question.
-- If the user asks for steps, and you offered steps moments ago, continue that thread.
+- Write like a helpful human.
+- Keep replies compact by default.
+- Do not use em dashes.
+- If the user says hi/hello, respond briefly and ask how you can help.
+- Ask a short follow-up question when it helps the conversation.
+- If the user asks for something unsafe or disallowed, refuse briefly and offer a safer alternative.
 
-Brand rules:
-- Do NOT assume payroll, taxes, or HR.
-- Do NOT bring up Paycheck Labs or company products in casual conversation.
-- Only mention Paycheck Labs if the user explicitly asks who made you, who you work with, or asks about the company/products.
-- If asked about Paycheck Labs, keep it short and factual.
-
-Safety:
-- Refuse harmful or illegal requests.
-- Be helpful and responsible.
+Content rules:
+- Do not assume you do payroll, HR, W-2s, tax forms, or payroll processing.
+- Do not bring up Paycheck Labs unless the user explicitly asks who created you, asks about your origin, or asks about Paycheck Labs.
+- If asked who created you: say you were created by Paycheck Labs.
 """
 
-# -----------------------------
-# Utilities
-# -----------------------------
-def _clean_text(text: str) -> str:
-    return (text or "").strip()
+# ---------------------------
+# Lightweight memory (per chat)
+# Stores last N user/assistant turns so follow-ups work.
+# ---------------------------
+MAX_TURNS = 10  # user+assistant pairs
+chat_memory: Dict[int, Deque[Tuple[str, str]]] = defaultdict(lambda: deque(maxlen=MAX_TURNS * 2))
+
 
 def _is_private_chat(update: Update) -> bool:
     return bool(update.effective_chat and update.effective_chat.type == "private")
 
-def _bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
-    # Telegram username includes no @ in the API value; we add it
-    try:
-        uname = context.bot.username or ""
-        uname = uname.strip()
-        return f"@{uname}" if uname else ""
-    except Exception:
-        return ""
 
-def _should_respond(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    Rules:
-    - In private DMs: respond to normal messages (and triggers still work).
-    - In groups/supergroups: respond only if:
-        1) message starts with /penny
-        2) message starts with @HeyPennyBot OR @<actual_bot_username>
-        3) message is a reply to Penny (reply_to_message.from_user.id == bot id)
-    """
-    msg = update.effective_message
-    if not msg:
-        return False
+def _text(update: Update) -> str:
+    return (update.message.text or "").strip() if update.message else ""
 
-    text = _clean_text(msg.text or msg.caption or "")
-    if not text and not msg.reply_to_message:
+
+def _reply_text(update: Update) -> Optional[str]:
+    if not update.message or not update.message.reply_to_message:
+        return None
+    return (update.message.reply_to_message.text or "").strip()
+
+
+def _reply_from_bot(update: Update) -> bool:
+    """
+    True if user is replying to a message authored by this bot.
+    """
+    if not update.message or not update.message.reply_to_message:
         return False
+    bot = update.get_bot()
+    reply_sender = update.message.reply_to_message.from_user
+    return bool(reply_sender and bot and reply_sender.id == bot.id)
+
+
+def _should_respond(update: Update) -> Tuple[bool, str]:
+    """
+    Returns (should_respond, cleaned_user_prompt)
+    In groups: only respond to /penny, @HeyPennyBot, or replies to Penny.
+    In DMs: respond to any text message.
+    """
+    text = _text(update)
+    if not text:
+        return False, ""
 
     if _is_private_chat(update):
-        return True
+        # In DMs, respond normally. Also allow /penny as a prefix.
+        if text.lower().startswith("/penny"):
+            cleaned = text[len("/penny") :].strip()
+            return True, cleaned if cleaned else "Hi"
+        return True, text
 
     # Group chat rules
-    bot_un = _bot_username(context)
-    mention_triggers = [MENTION_TRIGGER_DEFAULT]
-    if bot_un:
-        mention_triggers.append(bot_un)
+    # 1) /penny prefix
+    if text.lower().startswith("/penny"):
+        cleaned = text[len("/penny") :].strip()
+        return True, cleaned if cleaned else "Hi"
 
-    starts_with_command = text.lower().startswith(COMMAND_TRIGGER)
-    starts_with_mention = any(text.startswith(m) for m in mention_triggers)
+    # 2) @HeyPennyBot prefix
+    if text.startswith(BOT_MENTION):
+        cleaned = text[len(BOT_MENTION) :].strip()
+        return True, cleaned if cleaned else "Hi"
 
-    replied_to_bot = False
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        replied_to_bot = (msg.reply_to_message.from_user.id == context.bot.id)
+    # 3) Reply to Penny
+    if _reply_from_bot(update):
+        return True, text
 
-    return starts_with_command or starts_with_mention or replied_to_bot
+    return False, ""
 
-def _strip_triggers(text: str, context: ContextTypes.DEFAULT_TYPE) -> str:
+
+def _add_to_memory(chat_id: int, role: str, content: str) -> None:
+    chat_memory[chat_id].append((role, content))
+
+
+def _build_openai_input(chat_id: int, user_prompt: str) -> list:
     """
-    Remove /penny or @mention prefix so the model sees the actual request.
+    Build an input array for the Responses API using a small rolling context.
     """
-    t = _clean_text(text)
-    if not t:
-        return t
+    history = list(chat_memory[chat_id])
+    input_items = [{"role": "system", "content": SYSTEM_PREAMBLE.strip()}]
 
-    # Remove /penny prefix
-    if t.lower().startswith(COMMAND_TRIGGER):
-        t = t[len(COMMAND_TRIGGER):].strip()
-        return t if t else "Hi"
+    for role, content in history:
+        input_items.append({"role": role, "content": content})
 
-    # Remove @mention prefix
-    bot_un = _bot_username(context)
-    mention_triggers = [MENTION_TRIGGER_DEFAULT]
-    if bot_un:
-        mention_triggers.append(bot_un)
+    input_items.append({"role": "user", "content": user_prompt})
+    return input_items
 
-    for m in mention_triggers:
-        if t.startswith(m):
-            t = t[len(m):].strip()
-            return t if t else "Hi"
 
-    return t
+def _friendly_error_message() -> str:
+    return "I ran into a temporary issue calling the model. Try again in a moment."
 
-def _push_memory(chat_id: int, role: str, content: str) -> None:
-    content = _clean_text(content)
-    if not content:
-        return
-    CHAT_MEMORY[chat_id].append((role, content))
 
-def _build_input(chat_id: int, user_text: str, reply_context: Optional[str]) -> List[dict]:
-    """
-    Build Responses API input as a list of messages.
-    Include:
-    - system preamble
-    - short reply-context if user replied to Penny
-    - recent memory turns
-    - current user message
-    """
-    items: List[dict] = []
+def _clean_greeting(user_prompt: str) -> bool:
+    low = user_prompt.strip().lower()
+    return low in {"hi", "hello", "hey", "yo", "sup", "good morning", "good evening", "good afternoon"}
 
-    items.append({
-        "role": "system",
-        "content": [{"type": "input_text", "text": SYSTEM_PREAMBLE}],
-    })
 
-    if reply_context:
-        items.append({
-            "role": "system",
-            "content": [{"type": "input_text", "text": f"Context: The user is replying to this message: {reply_context}"}],
-        })
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Hey. How can I help you?")
 
-    # memory
-    for role, content in CHAT_MEMORY[chat_id]:
-        items.append({
-            "role": role,
-            "content": [{"type": "input_text", "text": content}],
-        })
-
-    # current user
-    items.append({
-        "role": "user",
-        "content": [{"type": "input_text", "text": user_text}],
-    })
-
-    return items
-
-def _extract_output_text(resp) -> str:
-    """
-    Prefer resp.output_text.
-    If empty, attempt to extract from resp.output structure.
-    """
-    try:
-        txt = (resp.output_text or "").strip()
-        if txt:
-            return txt
-    except Exception:
-        pass
-
-    # Fallback parse
-    try:
-        parts: List[str] = []
-        for item in getattr(resp, "output", []) or []:
-            if isinstance(item, dict) and item.get("type") == "message":
-                for c in item.get("content", []) or []:
-                    # content parts can vary; prefer any text fields we can find
-                    if isinstance(c, dict):
-                        if "text" in c and isinstance(c["text"], str):
-                            parts.append(c["text"])
-                        elif c.get("type") in ("output_text", "input_text") and isinstance(c.get("text"), str):
-                            parts.append(c["text"])
-        return "\n".join([p.strip() for p in parts if p.strip()]).strip()
-    except Exception:
-        return ""
-
-async def _call_llm(chat_id: int, user_text: str, reply_context: Optional[str]) -> str:
-    """
-    Calls OpenAI Responses API with memory.
-    Avoids parameters that certain models reject.
-    """
-    input_items = _build_input(chat_id, user_text, reply_context)
-
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        input=input_items,
-        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
-    )
-
-    answer = _extract_output_text(resp).strip()
-    return answer
-
-# -----------------------------
-# Handlers
-# -----------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hi. I’m Penny. How can I help?")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Quick ways to talk to me:\n"
-        "- In groups: start with /penny or @HeyPennyBot, or reply to one of my messages\n"
-        "- In DMs: just message me normally\n\n"
-        "Try:\n"
-        "- /penny Summarize this in 3 bullets\n"
-        "- /penny Help me write a short caption\n"
-        "- /penny What is 864 x 327?"
+        "Use /penny <message> in group chats, or reply to me, or start with @HeyPennyBot.\n"
+        "In DMs, just message me normally."
     )
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if not msg:
-        return
-
-    chat_id = update.effective_chat.id
-    raw_text = _clean_text(msg.text or msg.caption or "")
-
-    # Only respond when rules allow
-    if not _should_respond(update, context):
-        return
-
-    # Reply context (if user replied to Penny)
-    reply_context = None
-    if msg.reply_to_message and msg.reply_to_message.text:
-        # Only use reply context if they replied to Penny directly
-        if msg.reply_to_message.from_user and msg.reply_to_message.from_user.id == context.bot.id:
-            reply_context = _clean_text(msg.reply_to_message.text)
-
-    # Normalize user input
-    user_text = _strip_triggers(raw_text, context)
-    if not user_text:
-        user_text = "Hi"
-
-    # Save user message to memory
-    _push_memory(chat_id, "user", user_text)
-
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        answer = await _call_llm(chat_id, user_text, reply_context)
+        should_respond, prompt = _should_respond(update)
+        if not should_respond:
+            return
 
-        if not answer:
-            answer = "Got it. What would you like to do next?"
+        chat_id = update.effective_chat.id
 
-        # Save assistant answer to memory
-        _push_memory(chat_id, "assistant", answer)
+        # Quick compact greeting behavior
+        if _clean_greeting(prompt):
+            reply = "Hey. How can I help you?"
+            _add_to_memory(chat_id, "user", prompt)
+            _add_to_memory(chat_id, "assistant", reply)
+            await update.message.reply_text(reply)
+            return
 
-        await msg.reply_text(answer)
+        if not client:
+            await update.message.reply_text("OpenAI is not configured yet. Missing OPENAI_API_KEY.")
+            return
 
-    except Exception as e:
-        logger.exception("LLM call failed: %s", e)
-        await msg.reply_text(
-            "I hit an error calling the model. Check Railway logs and your OPENAI settings."
+        # Add user message to memory before calling model
+        _add_to_memory(chat_id, "user", prompt)
+
+        # Build context-aware input
+        openai_input = _build_openai_input(chat_id, prompt)
+
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            input=openai_input,
+            max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
         )
 
-def main():
+        output_text = (response.output_text or "").strip()
+        if not output_text:
+            output_text = "I did not get a response back. Try again."
+
+        # Save assistant reply to memory
+        _add_to_memory(chat_id, "assistant", output_text)
+
+        await update.message.reply_text(output_text)
+
+    except Exception as e:
+        # Log the real error so Railway logs show the cause
+        logger.exception("OpenAI call failed: %s", str(e))
+        await update.message.reply_text(_friendly_error_message())
+
+
+def main() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
 
-    # Catch all text messages (commands excluded)
+    # Handle text messages (no commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    # Also allow captions (photos w/ text, etc.)
-    app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_text))
 
-    logger.info("Penny is running (%s). Model=%s", ENV, OPENAI_MODEL)
+    logger.info("Penny is running...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
