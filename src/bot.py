@@ -220,6 +220,23 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"@{BOT_USERNAME} What should I do next?"
     )
 
+# TEMP: Get Telegram GIF file_id (send GIF to Penny in a DM)
+async def debug_get_gif_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    # Only respond in private chat so we don't spam groups
+    if msg.chat.type != ChatType.PRIVATE:
+        return
+
+    if msg.animation:
+        file_id = msg.animation.file_id
+        await msg.reply_text(f"GIF file_id:\n{file_id}")
+        logger.info("WELCOME_GIF_FILE_ID=%s", file_id)
+    else:
+        await msg.reply_text("No GIF animation detected. Please send the GIF as an animation (GIF).")
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.text:
@@ -267,6 +284,9 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+
+    # TEMP: Listen for GIFs in DM and reply with file_id
+    app.add_handler(MessageHandler(filters.ANIMATION, debug_get_gif_file_id))
 
     # Text messages only
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
