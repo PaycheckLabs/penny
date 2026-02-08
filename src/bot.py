@@ -1,6 +1,7 @@
 import os
-import re
 import logging
+from typing import Tuple, Optional
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -12,155 +13,207 @@ from telegram.ext import (
 
 from openai import OpenAI
 
-# -------------------------
+# -----------------------------
 # Logging
-# -------------------------
+# -----------------------------
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("penny")
+logger = logging.getLogger("penny")
 
-# -------------------------
-# Env + Clients
-# -------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano").strip()
+# -----------------------------
+# Config
+# -----------------------------
+BOT_USERNAME = os.getenv("BOT_USERNAME", "HeyPennyBot").lstrip("@")  # e.g. HeyPennyBot
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")  # change anytime in Railway env vars
+MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "220"))
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
-
-# OpenAI client is optional at runtime; bot can still run without it
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-log.info(f"Booting Penny. OpenAI enabled: {bool(client)} | Model: {OPENAI_MODEL}")
-
-# -------------------------
-# Personality + Rules
-# -------------------------
-SYSTEM_PREAMBLE = """
-You are Penny, a friendly, supportive AI assistant.
-
-Style:
-- Be concise. Prefer 1 to 4 short sentences.
-- Sound natural and human.
-- No em dashes.
-- Ask a brief follow-up question when it helps.
-- Use bullets only when listing 3+ items.
-
-Content rules:
-- Do not mention Paycheck Labs, payroll, or paychecks in casual conversation.
-- Only mention Paycheck Labs if the user asks who made you, who you work for, or asks about the company directly.
-- If the user asks about Paycheck Labs, answer briefly and do not invent details. If you are unsure, say so.
-
-Safety:
-- Refuse harmful requests. Offer safer alternatives.
-"""
-
-PAYCHECK_TRIGGERS = re.compile(
-    r"\b(paycheck\s?labs|checks platform|check token|\$check|paychain|paymart|who made you|who created you|who built you|your creator|your company)\b",
-    re.IGNORECASE,
+SYSTEM_PREAMBLE = (
+    "You are Penny, a friendly, compact, human-sounding AI assistant.\n"
+    "\n"
+    "Style rules:\n"
+    "- Keep replies concise by default (usually 1 to 6 sentences).\n"
+    "- Do not use em dashes.\n"
+    "- Be conversational, supportive, and inquisitive when helpful.\n"
+    "- If the user says hi/hello, respond briefly and ask how you can help.\n"
+    "- If the user asks unclear or broad questions, ask a short clarifying question.\n"
+    "\n"
+    "Brand rules:\n"
+    "- Do not bring up Paycheck Labs, payroll, paychecks, or company products in casual conversation.\n"
+    "- Only mention Paycheck Labs if the user specifically asks who created you or directly asks about it.\n"
+    "\n"
+    "Safety:\n"
+    "- Follow common-sense safety. Refuse harmful requests.\n"
 )
 
-GREETINGS = {
-    "hi", "hello", "hey", "yo", "sup", "gm", "good morning", "good evening", "good afternoon"
-}
+# OpenAI client (expects OPENAI_API_KEY in env)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# -------------------------
-# Commands
-# -------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Hey. I’m Penny.\n\nHow can I help?"
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _strip_trigger_prefix(text: str, trigger: str) -> str:
+    """
+    Removes the trigger prefix from the start of text, returning the remaining prompt.
+    Handles punctuation/whitespace after the trigger.
+    """
+    t = text.strip()
+    if not t.lower().startswith(trigger.lower()):
+        return t
+    remainder = t[len(trigger) :].lstrip()
+    # Trim common separators after mention/command
+    if remainder.startswith((",", ":", "-", "—")):
+        remainder = remainder[1:].lstrip()
+    return remainder
+
+
+def should_respond(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Returns (should_respond, reason, prompt_text)
+    Reasons: "dm", "slash", "mention", "reply"
+    """
+    msg = update.message
+    if not msg or not msg.text:
+        return (False, None, None)
+
+    text = msg.text.strip()
+    if not text:
+        return (False, None, None)
+
+    # --------------- IMPORTANT CHANGE ---------------
+    # In private DMs, respond to normal messages (natural chat).
+    if msg.chat and msg.chat.type == "private":
+        return (True, "dm", text)
+    # ------------------------------------------------
+
+    # Group/supergroup/channel behavior: only respond when invoked.
+
+    # 1) /penny (including /penny@BotName)
+    # Note: If message is "/penny ..." it will often be handled by CommandHandler,
+    # but we also gate here to support plain "/penny hello" text patterns.
+    if text.lower().startswith("/penny"):
+        prompt = text
+        # remove /penny or /penny@BotName prefix
+        # split first token then use remainder
+        first_token = text.split(maxsplit=1)[0]
+        remainder = text[len(first_token) :].strip()
+        prompt = remainder if remainder else ""
+        return (True, "slash", prompt)
+
+    # 2) @HeyPennyBot mention at the start
+    mention_prefix = f"@{BOT_USERNAME}".lower()
+    if text.lower().startswith(mention_prefix):
+        prompt = _strip_trigger_prefix(text, f"@{BOT_USERNAME}")
+        return (True, "mention", prompt)
+
+    # 3) Reply to Penny's message
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        try:
+            if msg.reply_to_message.from_user.id == context.bot.id:
+                return (True, "reply", text)
+        except Exception:
+            pass
+
+    return (False, None, None)
+
+
+async def llm_reply(user_text: str) -> str:
+    """
+    Calls OpenAI and returns assistant text.
+    We avoid temperature because some models only support the default.
+    """
+    user_text = (user_text or "").strip()
+    if not user_text:
+        user_text = "Hi"
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PREAMBLE},
+            {"role": "user", "content": user_text},
+        ],
+        max_tokens=MAX_OUTPUT_TOKENS,
     )
+
+    content = (resp.choices[0].message.content or "").strip()
+    return content if content else "Hey. How can I help you?"
+
+
+# -----------------------------
+# Handlers
+# -----------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Hey. How can I help you?")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Here are a few things you can ask me:\n"
-        "- Help me write a message\n"
-        "- Summarize this text\n"
-        "- Explain a topic simply\n"
-        "- Brainstorm ideas\n\n"
-        "What are you working on?"
+        "Quick tips:\n"
+        "- In groups: use /penny, start with @HeyPennyBot, or reply to me.\n"
+        "- In DMs: just type normally.\n"
+        "\n"
+        "Examples:\n"
+        "- /penny write a short announcement\n"
+        "- @HeyPennyBot summarize this in 3 bullets"
     )
 
-# -------------------------
-# OpenAI helper
-# -------------------------
-def build_company_reply(user_text: str) -> str:
-    # Keep this minimal for now; later you can replace with a proper knowledge file/database.
-    return (
-        "I’m Penny. I was created for a crypto and software team.\n"
-        "If you tell me what you want to know about the project, I’ll keep it short and clear.\n\n"
-        "What part are you curious about?"
-    )
+async def penny_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles /penny <prompt>
+    """
+    msg = update.message
+    if not msg:
+        return
 
-def call_openai(user_text: str) -> str:
-    if not client:
-        return "I’m running without my language model right now. Try again in a bit."
+    prompt = ""
+    if context.args:
+        prompt = " ".join(context.args).strip()
 
     try:
-        # IMPORTANT: no temperature parameter (your model rejected it)
-        resp = client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": SYSTEM_PREAMBLE.strip()},
-                {"role": "user", "content": user_text.strip()},
-            ],
-            max_output_tokens=220,
-        )
-
-        # responses API output parsing
-        text = (resp.output_text or "").strip()
-        if not text:
-            return "I’m here. What would you like to do?"
-
-        # Hard cap in case the model runs long
-        if len(text) > 900:
-            text = text[:900].rstrip() + "…"
-
-        return text
-
+        reply = await llm_reply(prompt)
+        await msg.reply_text(reply)
     except Exception as e:
-        log.exception("OpenAI error")
-        return "I hit an error calling the model. Check Railway logs and your OPENAI settings."
+        logger.exception("OpenAI error in /penny: %s", e)
+        await msg.reply_text("I hit an error calling the model. Check Railway logs and your OPENAI settings.")
 
-# -------------------------
-# Message handler
-# -------------------------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if not text:
+    """
+    Handles non-command text. In DMs: always respond.
+    In groups: only respond when invoked (/penny, @mention, or reply).
+    """
+    ok, reason, prompt = should_respond(update, context)
+    if not ok:
         return
 
-    lower = text.lower()
-
-    # Short greeting behavior
-    if lower in GREETINGS or any(lower.startswith(g + " ") for g in GREETINGS):
-        await update.message.reply_text("Hey, how’s it going?")
+    # In groups, if user invoked with @mention or /penny but gave no prompt, ask a short follow-up.
+    if reason in {"slash", "mention"} and (prompt is None or not prompt.strip()):
+        await update.message.reply_text("Hey. What do you want to do?")
         return
 
-    # If user is asking about the company/creator, allow a small response
-    if PAYCHECK_TRIGGERS.search(text):
-        await update.message.reply_text(build_company_reply(text))
-        return
+    try:
+        reply = await llm_reply(prompt or "")
+        await update.message.reply_text(reply)
+    except Exception as e:
+        logger.exception("OpenAI error in handle_text: %s", e)
+        await update.message.reply_text("I hit an error calling the model. Check Railway logs and your OPENAI settings.")
 
-    # Normal assistant flow
-    reply = call_openai(text)
-    await update.message.reply_text(reply)
 
-# -------------------------
-# Main
-# -------------------------
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
 
+    app = ApplicationBuilder().token(token).build()
+
+    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("penny", penny_command))
 
-    # Reply to any non-command text messages
+    # Non-command text (DMs + invoked group messages)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    log.info("Penny is running...")
+    logger.info("Penny is running...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
