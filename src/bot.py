@@ -40,6 +40,10 @@ OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "260").stri
 BOT_USERNAME = os.getenv("BOT_USERNAME", "HeyPennyBot").strip().lstrip("@")
 BOT_TRIGGER = os.getenv("BOT_TRIGGER", "/penny").strip()
 
+# NEW: posting utility
+TEST_GROUP_CHAT_ID = int(os.getenv("TEST_GROUP_CHAT_ID", "0").strip())
+ADMIN_TELEGRAM_USER_ID = int(os.getenv("ADMIN_TELEGRAM_USER_ID", "0").strip())
+
 # Optional
 ENV = os.getenv("ENV", "production").strip()
 
@@ -220,6 +224,38 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"@{BOT_USERNAME} What should I do next?"
     )
 
+# NEW: Post a caption from DM into the Testing Group
+async def post_test_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    # Keep this command to DM only
+    if msg.chat.type != ChatType.PRIVATE:
+        await msg.reply_text("Please use /posttestcaption in DM with me.")
+        return
+
+    # Optional security: only allow you if ADMIN_TELEGRAM_USER_ID is set
+    if ADMIN_TELEGRAM_USER_ID and msg.from_user and msg.from_user.id != ADMIN_TELEGRAM_USER_ID:
+        await msg.reply_text("Not authorized.")
+        return
+
+    if not TEST_GROUP_CHAT_ID:
+        await msg.reply_text("TEST_GROUP_CHAT_ID is not set in Railway variables.")
+        return
+
+    caption = " ".join(context.args).strip() if context.args else ""
+    if not caption:
+        await msg.reply_text("Usage:\n/posttestcaption <your caption text>")
+        return
+
+    try:
+        await context.bot.send_message(chat_id=TEST_GROUP_CHAT_ID, text=caption)
+        await msg.reply_text("Posted to the Penny Testing Group ✅")
+    except Exception as e:
+        logger.exception("post_test_caption failed: %r", e)
+        await msg.reply_text(f"Failed to post. Error: {e!r}")
+
 # TEMP: Get Telegram GIF file_id (send GIF to Penny in a DM)
 async def debug_get_gif_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -284,6 +320,9 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+
+    # NEW: /posttestcaption command
+    app.add_handler(CommandHandler("posttestcaption", post_test_caption))
 
     # TEMP: Listen for GIFs in DM and reply with file_id
     app.add_handler(MessageHandler(filters.ANIMATION, debug_get_gif_file_id))
