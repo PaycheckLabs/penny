@@ -18,6 +18,9 @@ from telegram.ext import (
 from openai import OpenAI
 from welcome_gate import register_welcome_gate_handlers
 
+# NEW: Paycheck Labs knowledge base (lightweight retrieval)
+from knowledge_base import build_kb_context
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -183,6 +186,12 @@ def extract_output_text(resp) -> str:
 
 def build_messages(chat_id: int, user_id: int, user_text: str) -> List[Dict[str, str]]:
     msgs: List[Dict[str, str]] = [{"role": "developer", "content": SYSTEM_PROMPT}]
+
+    # NEW: inject KB context only when relevant
+    kb_context = build_kb_context(user_text, max_sections=3)
+    if kb_context:
+        msgs.append({"role": "developer", "content": kb_context})
+
     msgs.extend(get_memory(chat_id, user_id))
     msgs.append({"role": "user", "content": user_text})
     return msgs
@@ -230,7 +239,6 @@ async def stash_dm_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Photo
     if msg.photo:
-        # Highest resolution is last
         file_id = msg.photo[-1].file_id
         _stash_dm_media(msg.from_user.id, "photo", file_id)
         await msg.reply_text("Got it. Now send /posttestcaption <text> and I will post the image + caption to the group.")
@@ -339,7 +347,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("posttestcaption", post_test_caption))
 
-    # NEW: stash media in DM for later posting
+    # stash media in DM for later posting
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.ANIMATION), stash_dm_media))
 
     # TEMP: Listen for GIFs in DM and reply with file_id (kept for convenience)
