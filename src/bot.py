@@ -1,7 +1,6 @@
 import os
+import re
 import logging
-from typing import Dict, Optional
-
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -13,217 +12,155 @@ from telegram.ext import (
 
 from openai import OpenAI
 
-# -----------------------------
+# -------------------------
 # Logging
-# -----------------------------
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+# -------------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("penny")
 
-# -----------------------------
-# Env / Config
-# -----------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-PENNY_TEST_CHAT_ID = int(os.getenv("PENNY_TEST_CHAT_ID", "0"))
-
-# Comma-separated numeric Telegram user IDs, e.g. "123456789,987654321"
-ADMIN_USER_IDS = set(
-    int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()
-)
+# -------------------------
+# Env + Clients
+# -------------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano").strip()
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var.")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY env var.")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# OpenAI client is optional at runtime; bot can still run without it
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-SYSTEM_PROMPT = (
-    "You are Penny, an AI virtual assistant created by Paycheck Labs. "
-    "Be conversational, clear, and helpful. Keep answers clean and concise. "
-    "Ask a short follow-up question only when needed."
+log.info(f"Booting Penny. OpenAI enabled: {bool(client)} | Model: {OPENAI_MODEL}")
+
+# -------------------------
+# Personality + Rules
+# -------------------------
+SYSTEM_PREAMBLE = """
+You are Penny, a friendly, supportive AI assistant.
+
+Style:
+- Be concise. Prefer 1 to 4 short sentences.
+- Sound natural and human.
+- No em dashes.
+- Ask a brief follow-up question when it helps.
+- Use bullets only when listing 3+ items.
+
+Content rules:
+- Do not mention Paycheck Labs, payroll, or paychecks in casual conversation.
+- Only mention Paycheck Labs if the user asks who made you, who you work for, or asks about the company directly.
+- If the user asks about Paycheck Labs, answer briefly and do not invent details. If you are unsure, say so.
+
+Safety:
+- Refuse harmful requests. Offer safer alternatives.
+"""
+
+PAYCHECK_TRIGGERS = re.compile(
+    r"\b(paycheck\s?labs|checks platform|check token|\$check|paychain|paymart|who made you|who created you|who built you|your creator|your company)\b",
+    re.IGNORECASE,
 )
 
-# -----------------------------
-# In-memory state (per process)
-# Stores last uploaded photo file_id per admin user
-# -----------------------------
-LAST_PHOTO_FILE_ID_BY_USER: Dict[int, str] = {}
+GREETINGS = {
+    "hi", "hello", "hey", "yo", "sup", "gm", "good morning", "good evening", "good afternoon"
+}
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def is_admin(update: Update) -> bool:
-    uid = update.effective_user.id if update.effective_user else None
-    return uid in ADMIN_USER_IDS
-
-
-# -----------------------------
+# -------------------------
 # Commands
-# -----------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Hi, I'm Penny. What can I help you with today?")
+# -------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hey. I’m Penny.\n\nHow can I help?"
+    )
 
-# Utility: run in a group to get the chat id (safe to delete later)
-async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    await update.message.reply_text(f"chat.id = {chat.id}\nchat.type = {chat.type}")
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Here are a few things you can ask me:\n"
+        "- Help me write a message\n"
+        "- Summarize this text\n"
+        "- Explain a topic simply\n"
+        "- Brainstorm ideas\n\n"
+        "What are you working on?"
+    )
 
-# Admin-only: post an image URL + caption into the Penny Testing Chat
-# Usage:
-#   /posttest https://example.com/image.png | Your caption text
-async def posttest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    if not is_admin(update):
-        return
+# -------------------------
+# OpenAI helper
+# -------------------------
+def build_company_reply(user_text: str) -> str:
+    # Keep this minimal for now; later you can replace with a proper knowledge file/database.
+    return (
+        "I’m Penny. I was created for a crypto and software team.\n"
+        "If you tell me what you want to know about the project, I’ll keep it short and clear.\n\n"
+        "What part are you curious about?"
+    )
 
-    if PENNY_TEST_CHAT_ID == 0:
-        await update.message.reply_text("Missing PENNY_TEST_CHAT_ID env var.")
-        return
-
-    raw = update.message.text or ""
-    payload = raw.replace("/posttest", "", 1).strip()
-
-    if not payload:
-        await update.message.reply_text("Usage: /posttest <image_url> | <caption>")
-        return
-
-    parts = [p.strip() for p in payload.split("|", 1)]
-    image_url = parts[0]
-    caption = parts[1] if len(parts) > 1 else ""
-
-    if not image_url.startswith("http"):
-        await update.message.reply_text("Image must be a public http(s) URL.")
-        return
+def call_openai(user_text: str) -> str:
+    if not client:
+        return "I’m running without my language model right now. Try again in a bit."
 
     try:
-        await context.bot.send_photo(
-            chat_id=PENNY_TEST_CHAT_ID,
-            photo=image_url,
-            caption=caption,
-        )
-        # Silent success
-        return
-    except Exception:
-        logger.exception("Failed to post image to testing chat (URL)")
-        await update.message.reply_text("Failed to post. Check logs.")
-
-# Admin-only: capture last photo you DM to Penny
-async def capture_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.photo:
-        return
-    if not is_admin(update):
-        return
-
-    user_id = update.effective_user.id
-    # Highest resolution photo is last in the list
-    file_id = update.message.photo[-1].file_id
-    LAST_PHOTO_FILE_ID_BY_USER[user_id] = file_id
-
-    # Extra polish: stay silent (or uncomment to confirm)
-    # await update.message.reply_text("Photo saved ✅")
-
-# Admin-only: repost your last uploaded photo to the testing chat with a caption
-# Workflow:
-#   1) Upload photo in Penny DM
-#   2) /posttestcaption Your caption here
-async def posttestcaption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    if not is_admin(update):
-        return
-
-    if PENNY_TEST_CHAT_ID == 0:
-        await update.message.reply_text("Missing PENNY_TEST_CHAT_ID env var.")
-        return
-
-    user_id = update.effective_user.id
-    file_id: Optional[str] = LAST_PHOTO_FILE_ID_BY_USER.get(user_id)
-
-    if not file_id:
-        await update.message.reply_text(
-            "I don’t have a recent photo from you yet.\n"
-            "Send me an image first (in this DM), then run:\n"
-            "/posttestcaption <caption>"
-        )
-        return
-
-    caption = (update.message.text or "").replace("/posttestcaption", "", 1).strip()
-    if not caption:
-        await update.message.reply_text("Usage: /posttestcaption <caption>")
-        return
-
-    try:
-        await context.bot.send_photo(
-            chat_id=PENNY_TEST_CHAT_ID,
-            photo=file_id,   # ✅ uses the exact uploaded Telegram photo
-            caption=caption,
-        )
-        # Silent success
-        return
-    except Exception:
-        logger.exception("Failed to post image to testing chat (file_id)")
-        await update.message.reply_text("Failed to post. Check logs.")
-
-
-# -----------------------------
-# Normal message handler (OpenAI)
-# -----------------------------
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
-        return
-
-    user_text = update.message.text.strip()
-
-    # Let command handlers deal with commands
-    if user_text.startswith("/"):
-        return
-
-    try:
-        resp = client.chat.completions.create(
+        # IMPORTANT: no temperature parameter (your model rejected it)
+        resp = client.responses.create(
             model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_text},
+            input=[
+                {"role": "system", "content": SYSTEM_PREAMBLE.strip()},
+                {"role": "user", "content": user_text.strip()},
             ],
-            temperature=0.7,
-        )
-        reply = resp.choices[0].message.content.strip()
-        await update.message.reply_text(reply)
-    except Exception:
-        logger.exception("Error calling OpenAI")
-        await update.message.reply_text(
-            "I hit an error calling the model. Check Railway logs and your OPENAI settings."
+            max_output_tokens=220,
         )
 
+        # responses API output parsing
+        text = (resp.output_text or "").strip()
+        if not text:
+            return "I’m here. What would you like to do?"
 
-# -----------------------------
+        # Hard cap in case the model runs long
+        if len(text) > 900:
+            text = text[:900].rstrip() + "…"
+
+        return text
+
+    except Exception as e:
+        log.exception("OpenAI error")
+        return "I hit an error calling the model. Check Railway logs and your OPENAI settings."
+
+# -------------------------
+# Message handler
+# -------------------------
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    lower = text.lower()
+
+    # Short greeting behavior
+    if lower in GREETINGS or any(lower.startswith(g + " ") for g in GREETINGS):
+        await update.message.reply_text("Hey, how’s it going?")
+        return
+
+    # If user is asking about the company/creator, allow a small response
+    if PAYCHECK_TRIGGERS.search(text):
+        await update.message.reply_text(build_company_reply(text))
+        return
+
+    # Normal assistant flow
+    reply = call_openai(text)
+    await update.message.reply_text(reply)
+
+# -------------------------
 # Main
-# -----------------------------
-def main() -> None:
+# -------------------------
+def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("chatid", chatid))
-    app.add_handler(CommandHandler("posttest", posttest))
-    app.add_handler(CommandHandler("posttestcaption", posttestcaption))
+    app.add_handler(CommandHandler("help", help_command))
 
-    # Capture admin-uploaded photos in DM (or anywhere Penny receives photos)
-    app.add_handler(MessageHandler(filters.PHOTO, capture_photo))
+    # Reply to any non-command text messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Messages
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("Penny bot started.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    log.info("Penny is running...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
