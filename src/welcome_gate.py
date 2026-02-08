@@ -11,12 +11,14 @@ from telegram import (
     InlineKeyboardMarkup,
     ChatPermissions,
 )
-from telegram.constants import ChatMemberStatus, ParseMode
+from telegram.constants import ChatMemberStatus, ParseMode, ChatType
 from telegram.ext import (
     ContextTypes,
     ChatMemberHandler,
     CallbackQueryHandler,
     ChatJoinRequestHandler,
+    MessageHandler,
+    filters,
 )
 
 log = logging.getLogger(__name__)
@@ -29,27 +31,24 @@ PAYCHECK_WEBSITE = "https://www.paycheck.io/"
 PAYCHECK_X = "https://x.com/PaycheckIO"
 PAYCHECK_MEDIUM = "https://medium.com/@paycheck"
 
-VERIFY_TIMEOUT_SECONDS = int(os.getenv("VERIFY_TIMEOUT_SECONDS", "180"))  # 3 minutes
+VERIFY_TIMEOUT_SECONDS = int(os.getenv("VERIFY_TIMEOUT_SECONDS", "180"))
 KICK_IF_NOT_VERIFIED = os.getenv("KICK_IF_NOT_VERIFIED", "true").lower() == "true"
 
-# Wrong-attempt behavior
 CAPTCHA_MAX_ATTEMPTS = int(os.getenv("CAPTCHA_MAX_ATTEMPTS", "3"))
 KICK_ON_TOO_MANY_WRONG = os.getenv("KICK_ON_TOO_MANY_WRONG", "true").lower() == "true"
 
-# Your welcome GIF
 WELCOME_GIF_FILE_ID = os.getenv("WELCOME_GIF_FILE_ID", "").strip()
 WELCOME_GIF_LOCAL_PATH = os.getenv("WELCOME_GIF_LOCAL_PATH", "").strip()
 
-# Callback prefix (keep short, callback_data has length limits)
 CB_VERIFY_PREFIX = "verify_gate:"
-
-# Captcha icons
 CAPTCHA_ICONS: List[str] = ["✅", "⭐", "🔷", "🍀"]
+
+# Anti-duplicate welcome window (seconds)
+WELCOME_DEDUP_SECONDS = int(os.getenv("WELCOME_DEDUP_SECONDS", "20"))
 
 
 # -----------------------------
 # In-memory state (MVP)
-# Swap to Redis/DB later for restart safety
 # -----------------------------
 
 @dataclass
@@ -58,16 +57,29 @@ class PendingVerification:
     user_id: int
     created_at: float
     welcome_message_id: Optional[int] = None
-    token: str = ""          # short per-user token
-    correct_index: int = 0   # which icon is correct
-    attempts: int = 0        # wrong attempts so far
+    token: str = ""
+    correct_index: int = 0
+    attempts: int = 0
 
+# pending verifications
+PENDING: Dict[str, PendingVerification] = {}
 
-PENDING: Dict[str, PendingVerification] = {}  # key: f"{chat_id}:{user_id}"
+# dedup: last time we started flow per user per chat
+LAST_WELCOME_TS: Dict[str, float] = {}  # key: f"{chat_id}:{user_id}" -> timestamp
 
 
 def _key(chat_id: int, user_id: int) -> str:
     return f"{chat_id}:{user_id}"
+
+
+def _recently_welcomed(chat_id: int, user_id: int) -> bool:
+    k = _key(chat_id, user_id)
+    now = time.time()
+    ts = LAST_WELCOME_TS.get(k, 0.0)
+    if now - ts < WELCOME_DEDUP_SECONDS:
+        return True
+    LAST_WELCOME_TS[k] = now
+    return False
 
 
 def _restricted_perms() -> ChatPermissions:
@@ -130,7 +142,7 @@ async def _lift_gate(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_T
 async def _kick_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-        await context.bot.unban_chat_member(chat_id=chat_id, user_id=user_id)  # kick behavior
+        await context.bot.unban_chat_member(chat_id=chat_id, user_id=user_id)
     except Exception:
         log.exception("Failed to kick user %s in chat %s", user_id, chat_id)
 
@@ -161,7 +173,6 @@ def _build_keyboard(chat_id: int, user_id: int, token: str) -> InlineKeyboardMar
 
     captcha_buttons: List[InlineKeyboardButton] = []
     for idx, icon in enumerate(CAPTCHA_ICONS):
-        # verify_gate:<chat_id>:<user_id>:<token>:<choice_index>
         cd = f"{CB_VERIFY_PREFIX}{chat_id}:{user_id}:{token}:{idx}"
         captcha_buttons.append(InlineKeyboardButton(icon, callback_data=cd))
 
@@ -185,7 +196,6 @@ async def _timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data or {}
     chat_id = data.get("chat_id")
     user_id = data.get("user_id")
-
     if chat_id is None or user_id is None:
         return
 
@@ -212,7 +222,6 @@ async def _timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _parse_callback(data: str) -> Optional[Tuple[int, int, str, int]]:
-    # verify_gate:<chat_id>:<user_id>:<token>:<choice_index>
     try:
         payload = data[len(CB_VERIFY_PREFIX):]
         chat_id_str, user_id_str, token, choice_str = payload.split(":")
@@ -221,67 +230,31 @@ def _parse_callback(data: str) -> Optional[Tuple[int, int, str, int]]:
         return None
 
 
-# -----------------------------
-# NEW: Join request handler (private groups using invite links w/ approval)
-# -----------------------------
-async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _start_verification_flow(chat_id: int, user, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    If the group uses 'Request to Join' invite links, approve the request.
-    After approval, Telegram typically emits a chat_member update, which triggers the normal welcome flow.
+    Shared entry point. Called from multiple update types.
     """
-    req = update.chat_join_request
-    if not req:
-        return
-
-    chat_id = req.chat.id
-    user_id = req.from_user.id
-
-    try:
-        await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
-    except Exception:
-        log.exception("Failed to approve join request for user %s in chat %s", user_id, chat_id)
-
-
-# -----------------------------
-# Main join flow (post-approval or direct joins)
-# -----------------------------
-async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    result = update.chat_member
-    if not result:
-        return
-
-    chat = result.chat
-    new = result.new_chat_member
-    old = result.old_chat_member
-
-    user = new.user
     if user.is_bot:
         return
 
-    # Detect join:
-    # old: left/kicked -> new: member/restricted
-    joined = (old.status in [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED]) and (
-        new.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED]
-    )
-    if not joined:
+    user_id = user.id
+    if _recently_welcomed(chat_id, user_id):
         return
 
-    chat_id = chat.id
-    user_id = user.id
     first_name = user.first_name or "there"
 
-    # 1) Restrict immediately (hard gate)
+    # 1) Restrict immediately
     await _apply_hard_gate(chat_id, user_id, context)
 
-    # 2) Create captcha state
+    # 2) Captcha state
     token = secrets.token_hex(4)
     correct_index = secrets.randbelow(len(CAPTCHA_ICONS))
     required_icon = CAPTCHA_ICONS[correct_index]
 
-    # 3) Send welcome GIF + caption + buttons
     caption = _welcome_caption(first_name, required_icon)
     markup = _build_keyboard(chat_id, user_id, token)
 
+    # 3) Send welcome message
     sent = None
     try:
         if WELCOME_GIF_FILE_ID:
@@ -334,6 +307,71 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+# -----------------------------
+# Join request handler (only used if invite link requires approval)
+# -----------------------------
+async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    req = update.chat_join_request
+    if not req:
+        return
+
+    chat_id = req.chat.id
+    user = req.from_user
+
+    try:
+        await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=user.id)
+    except Exception:
+        log.exception("Failed to approve join request for user %s in chat %s", user.id, chat_id)
+        return
+
+    # After approval, Telegram may or may not emit chat_member reliably.
+    # Start flow immediately here too.
+    await _start_verification_flow(chat_id, user, context)
+
+
+# -----------------------------
+# Fallback: NEW_CHAT_MEMBERS service message (most reliable)
+# -----------------------------
+async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    if not msg or not msg.new_chat_members:
+        return
+
+    # Only groups/supergroups
+    if msg.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    chat_id = msg.chat.id
+    for user in msg.new_chat_members:
+        await _start_verification_flow(chat_id, user, context)
+
+
+# -----------------------------
+# ChatMember updates (nice when it fires)
+# -----------------------------
+async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cm = update.chat_member
+    if not cm:
+        return
+
+    user = cm.new_chat_member.user
+    if user.is_bot:
+        return
+
+    old = cm.old_chat_member
+    new = cm.new_chat_member
+
+    # A join is usually LEFT/KICKED -> MEMBER/RESTRICTED.
+    if old.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED) and new.status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.RESTRICTED,
+    ):
+        await _start_verification_flow(cm.chat.id, user, context)
+
+
+# -----------------------------
+# Captcha button handler
+# -----------------------------
 async def on_verify_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.data:
@@ -348,12 +386,10 @@ async def on_verify_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     chat_id, target_user_id, token, choice_index = parsed
-
     clicker = query.from_user
     if not clicker:
         return
 
-    # Only the intended user can verify
     if clicker.id != target_user_id:
         await query.answer("This verification is not for you.", show_alert=True)
         return
@@ -364,25 +400,22 @@ async def on_verify_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer("Verification expired. Please re-join.", show_alert=True)
         return
 
-    # Token must match (prevents reusing old buttons)
     if token != pv.token:
         await query.answer("Verification expired. Please re-join.", show_alert=True)
         return
 
-    # Correct choice
+    # Correct
     if choice_index == pv.correct_index:
         await query.answer("Verified ✅")
 
         await _lift_gate(chat_id, target_user_id, context)
 
-        # Cancel timeout job
         job_name = f"verify_timeout:{chat_id}:{target_user_id}"
         for j in context.job_queue.get_jobs_by_name(job_name):
             j.schedule_removal()
 
         PENDING.pop(k, None)
 
-        # Update message caption + remove captcha buttons
         try:
             await query.edit_message_caption(
                 caption="Verified ✅ Welcome in!",
@@ -392,7 +425,7 @@ async def on_verify_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             pass
         return
 
-    # Wrong choice
+    # Wrong
     pv.attempts += 1
     remaining = max(0, CAPTCHA_MAX_ATTEMPTS - pv.attempts)
 
@@ -410,7 +443,7 @@ async def on_verify_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             pass
         return
 
-    # Rotate challenge after wrong attempt
+    # Rotate challenge
     pv.token = secrets.token_hex(4)
     pv.correct_index = secrets.randbelow(len(CAPTCHA_ICONS))
     required_icon = CAPTCHA_ICONS[pv.correct_index]
@@ -427,10 +460,13 @@ async def on_verify_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 def register_welcome_gate_handlers(application) -> None:
-    # Join-request approval for private groups using invite links that require approval
+    # If join requests are enabled, approve and start flow
     application.add_handler(ChatJoinRequestHandler(on_join_request))
 
-    # Standard join flow
+    # Most reliable join signal in groups
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_chat_members))
+
+    # Nice-to-have when chat_member updates arrive
     application.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
 
     # Captcha button clicks
