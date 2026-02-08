@@ -1,8 +1,9 @@
 import os
 import time
 import logging
+import secrets
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 
 from telegram import (
     Update,
@@ -20,30 +21,34 @@ from telegram.ext import (
 log = logging.getLogger(__name__)
 
 # -----------------------------
-# Config (edit as needed)
+# Config
 # -----------------------------
 
 PAYCHECK_WEBSITE = "https://www.paycheck.io/"
 PAYCHECK_X = "https://x.com/PaycheckIO"
 PAYCHECK_MEDIUM = "https://medium.com/@paycheck"
 
-# Hard-gate settings
-VERIFY_TIMEOUT_SECONDS = int(os.getenv("VERIFY_TIMEOUT_SECONDS", "180"))  # 3 minutes default
+VERIFY_TIMEOUT_SECONDS = int(os.getenv("VERIFY_TIMEOUT_SECONDS", "180"))  # 3 minutes
 KICK_IF_NOT_VERIFIED = os.getenv("KICK_IF_NOT_VERIFIED", "true").lower() == "true"
 
-# Your welcome GIF:
-# Prefer using a Telegram file_id for reliability (fast + no hosting needed).
+# Optional: wrong-attempt behavior
+CAPTCHA_MAX_ATTEMPTS = int(os.getenv("CAPTCHA_MAX_ATTEMPTS", "3"))
+KICK_ON_TOO_MANY_WRONG = os.getenv("KICK_ON_TOO_MANY_WRONG", "true").lower() == "true"
+
+# Your welcome GIF
 WELCOME_GIF_FILE_ID = os.getenv("WELCOME_GIF_FILE_ID", "").strip()
-# If you prefer a local path (less ideal on cloud deploys unless bundled):
 WELCOME_GIF_LOCAL_PATH = os.getenv("WELCOME_GIF_LOCAL_PATH", "").strip()
 
-# Callback data prefix
-CB_VERIFY_PREFIX = "verify_gate:"
+# Callback prefix
+CB_VERIFY_PREFIX = "verify_gate:"  # keep short, callback_data has length limits
+
+# Captcha icons (simple and effective)
+CAPTCHA_ICONS: List[str] = ["✅", "⭐", "🔷", "🍀"]
 
 
 # -----------------------------
-# In-memory state
-# (fine for MVP; swap to Redis/DB later)
+# In-memory state (MVP)
+# Swap to Redis/DB later for restart safety
 # -----------------------------
 
 @dataclass
@@ -52,6 +57,9 @@ class PendingVerification:
     user_id: int
     created_at: float
     welcome_message_id: Optional[int] = None
+    token: str = ""                 # short per-user token
+    correct_index: int = 0          # which icon is correct
+    attempts: int = 0               # wrong attempts so far
 
 PENDING: Dict[str, PendingVerification] = {}  # key: f"{chat_id}:{user_id}"
 
@@ -60,33 +68,7 @@ def _key(chat_id: int, user_id: int) -> str:
     return f"{chat_id}:{user_id}"
 
 
-def _welcome_caption(first_name: str) -> str:
-    # Keep this short because it’s a GIF caption.
-    return (
-        f"Welcome, {first_name} 👋\n"
-        "I’m Penny, the AI Advisor for Paycheck Labs.\n\n"
-        "To chat here, please verify:\n"
-        "Tap Verify ✅ below."
-    )
-
-
-def _keyboard(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Paycheck Website", url=PAYCHECK_WEBSITE),
-            InlineKeyboardButton("Paycheck X", url=PAYCHECK_X),
-        ],
-        [
-            InlineKeyboardButton("Paycheck Medium", url=PAYCHECK_MEDIUM),
-        ],
-        [
-            InlineKeyboardButton("Verify ✅", callback_data=f"{CB_VERIFY_PREFIX}{chat_id}:{user_id}"),
-        ],
-    ])
-
-
 def _restricted_perms() -> ChatPermissions:
-    # Hard gate: no sending messages/media until verified.
     return ChatPermissions(
         can_send_messages=False,
         can_send_audios=False,
@@ -106,7 +88,6 @@ def _restricted_perms() -> ChatPermissions:
 
 
 def _allowed_perms() -> ChatPermissions:
-    # You can loosen/tighten these based on your group rules.
     return ChatPermissions(
         can_send_messages=True,
         can_send_audios=True,
@@ -123,7 +104,6 @@ def _allowed_perms() -> ChatPermissions:
 
 
 async def _apply_hard_gate(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Restrict user immediately on join
     try:
         await context.bot.restrict_chat_member(
             chat_id=chat_id,
@@ -135,7 +115,6 @@ async def _apply_hard_gate(chat_id: int, user_id: int, context: ContextTypes.DEF
 
 
 async def _lift_gate(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Restore permissions when verified
     try:
         await context.bot.restrict_chat_member(
             chat_id=chat_id,
@@ -146,10 +125,59 @@ async def _lift_gate(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_T
         log.exception("Failed to unrestrict user %s in chat %s", user_id, chat_id)
 
 
+async def _kick_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+        await context.bot.unban_chat_member(chat_id=chat_id, user_id=user_id)  # kick behavior
+    except Exception:
+        log.exception("Failed to kick user %s in chat %s", user_id, chat_id)
+
+
+def _welcome_caption(first_name: str, required_icon: str) -> str:
+    # Keep it short because GIF captions can be truncated
+    return (
+        f"Welcome, {first_name} 👋\n\n"
+        "Before you can chat, please verify.\n"
+        f"Tap the {required_icon} button below."
+    )
+
+
+def _build_keyboard(chat_id: int, user_id: int, token: str, required_icon: str) -> InlineKeyboardMarkup:
+    # 1) Info links
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton("Paycheck Website", url=PAYCHECK_WEBSITE),
+            InlineKeyboardButton("Paycheck X", url=PAYCHECK_X),
+        ],
+        [
+            InlineKeyboardButton("Paycheck Medium", url=PAYCHECK_MEDIUM),
+        ],
+    ]
+
+    # 2) Captcha buttons (one row)
+    captcha_buttons: List[InlineKeyboardButton] = []
+    for idx, icon in enumerate(CAPTCHA_ICONS):
+        # callback_data format: verify_gate:<chat_id>:<user_id>:<token>:<choice_index>
+        cd = f"{CB_VERIFY_PREFIX}{chat_id}:{user_id}:{token}:{idx}"
+        captcha_buttons.append(InlineKeyboardButton(icon, callback_data=cd))
+
+    rows.append(captcha_buttons)
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_verified_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Paycheck Website", url=PAYCHECK_WEBSITE),
+            InlineKeyboardButton("Paycheck X", url=PAYCHECK_X),
+        ],
+        [
+            InlineKeyboardButton("Paycheck Medium", url=PAYCHECK_MEDIUM),
+        ],
+    ])
+
+
 async def _timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Runs after VERIFY_TIMEOUT_SECONDS to handle unverified users.
-    """
     data = context.job.data or {}
     chat_id = data.get("chat_id")
     user_id = data.get("user_id")
@@ -157,35 +185,36 @@ async def _timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     pv = PENDING.get(k)
     if not pv:
-        return  # already verified/cleared
+        return
 
-    # Still pending -> enforce action
     if KICK_IF_NOT_VERIFIED:
-        try:
-            await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-            await context.bot.unban_chat_member(chat_id=chat_id, user_id=user_id)  # makes it a "kick"
-        except Exception:
-            log.exception("Failed to kick unverified user %s in chat %s", user_id, chat_id)
+        await _kick_user(chat_id, user_id, context)
 
-    # Clean up state
     PENDING.pop(k, None)
 
-    # Optional: update the welcome message buttons/caption to show expired
     if pv.welcome_message_id:
         try:
             await context.bot.edit_message_caption(
                 chat_id=chat_id,
                 message_id=pv.welcome_message_id,
                 caption="Verification window expired. Please re-join and verify.",
+                reply_markup=_build_verified_keyboard(),
             )
         except Exception:
             pass
 
 
+def _parse_callback(data: str) -> Optional[Tuple[int, int, str, int]]:
+    # verify_gate:<chat_id>:<user_id>:<token>:<choice_index>
+    try:
+        payload = data[len(CB_VERIFY_PREFIX):]
+        chat_id_str, user_id_str, token, choice_str = payload.split(":")
+        return int(chat_id_str), int(user_id_str), token, int(choice_str)
+    except Exception:
+        return None
+
+
 async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Fires on membership changes. We care about "user joined".
-    """
     result = update.chat_member
     if not result:
         return
@@ -194,13 +223,10 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     new = result.new_chat_member
     old = result.old_chat_member
 
-    # Only handle real users, not the bot itself
     user = new.user
     if user.is_bot:
         return
 
-    # Detect join event:
-    # old: left/kicked -> new: member/restricted
     joined = (old.status in [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED]) and (
         new.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED]
     )
@@ -211,12 +237,17 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = user.id
     first_name = user.first_name or "there"
 
-    # 1) Restrict immediately (hard gate)
+    # 1) Restrict immediately
     await _apply_hard_gate(chat_id, user_id, context)
 
-    # 2) Send welcome GIF + buttons
-    caption = _welcome_caption(first_name)
-    markup = _keyboard(chat_id, user_id)
+    # 2) Create captcha state
+    token = secrets.token_hex(4)  # short token, fits callback_data limits
+    correct_index = secrets.randbelow(len(CAPTCHA_ICONS))
+    required_icon = CAPTCHA_ICONS[correct_index]
+
+    # 3) Send welcome GIF + links + captcha buttons
+    caption = _welcome_caption(first_name, required_icon)
+    markup = _build_keyboard(chat_id, user_id, token, required_icon)
 
     sent = None
     try:
@@ -229,7 +260,6 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=markup,
             )
         elif WELCOME_GIF_LOCAL_PATH:
-            # Local file path. Works only if file exists on the deployed filesystem.
             with open(WELCOME_GIF_LOCAL_PATH, "rb") as f:
                 sent = await context.bot.send_animation(
                     chat_id=chat_id,
@@ -239,7 +269,6 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
                     reply_markup=markup,
                 )
         else:
-            # Fallback: no GIF set
             sent = await context.bot.send_message(
                 chat_id=chat_id,
                 text=caption,
@@ -248,16 +277,18 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         log.exception("Failed sending welcome content in chat %s", chat_id)
 
-    # 3) Store pending verification + schedule timeout enforcement
     pv = PendingVerification(
         chat_id=chat_id,
         user_id=user_id,
         created_at=time.time(),
         welcome_message_id=(sent.message_id if sent else None),
+        token=token,
+        correct_index=correct_index,
+        attempts=0,
     )
     PENDING[_key(chat_id, user_id)] = pv
 
-    # Replace existing job (in case they re-join quickly)
+    # 4) Schedule timeout
     job_name = f"verify_timeout:{chat_id}:{user_id}"
     for j in context.job_queue.get_jobs_by_name(job_name):
         j.schedule_removal()
@@ -270,10 +301,7 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-async def on_verify_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles clicking Verify ✅.
-    """
+async def on_verify_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.data:
         return
@@ -281,66 +309,91 @@ async def on_verify_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not query.data.startswith(CB_VERIFY_PREFIX):
         return
 
-    await query.answer()  # remove "loading..."
-
-    # Parse payload: verify_gate:<chat_id>:<user_id>
-    payload = query.data[len(CB_VERIFY_PREFIX):]
-    try:
-        chat_id_str, user_id_str = payload.split(":")
-        chat_id = int(chat_id_str)
-        target_user_id = int(user_id_str)
-    except Exception:
+    parsed = _parse_callback(query.data)
+    if not parsed:
+        await query.answer("Invalid verification.", show_alert=True)
         return
+
+    chat_id, target_user_id, token, choice_index = parsed
 
     clicker = query.from_user
     if not clicker:
         return
 
-    # Only the target user can verify themselves
+    # Only the intended user can verify
     if clicker.id != target_user_id:
-        await query.answer("This verify button isn’t for you.", show_alert=True)
+        await query.answer("This verification is not for you.", show_alert=True)
         return
 
     k = _key(chat_id, target_user_id)
     pv = PENDING.get(k)
     if not pv:
-        # Already verified/expired
+        await query.answer("Verification expired. Please re-join.", show_alert=True)
+        return
+
+    # Token must match (prevents reusing old buttons)
+    if token != pv.token:
+        await query.answer("Verification expired. Please re-join.", show_alert=True)
+        return
+
+    # Correct choice
+    if choice_index == pv.correct_index:
+        await query.answer("Verified ✅")
+
+        await _lift_gate(chat_id, target_user_id, context)
+
+        # Cancel timeout job
+        job_name = f"verify_timeout:{chat_id}:{target_user_id}"
+        for j in context.job_queue.get_jobs_by_name(job_name):
+            j.schedule_removal()
+
+        PENDING.pop(k, None)
+
+        # Update message caption + remove captcha buttons
         try:
-            await query.edit_message_caption(caption="You’re already verified ✅")
+            await query.edit_message_caption(
+                caption="Verified ✅ Welcome in!",
+                reply_markup=_build_verified_keyboard(),
+            )
         except Exception:
             pass
         return
 
-    # Lift restrictions
-    await _lift_gate(chat_id, target_user_id, context)
+    # Wrong choice
+    pv.attempts += 1
+    remaining = max(0, CAPTCHA_MAX_ATTEMPTS - pv.attempts)
 
-    # Clear state + cancel timeout job
-    PENDING.pop(k, None)
-    job_name = f"verify_timeout:{chat_id}:{target_user_id}"
-    for j in context.job_queue.get_jobs_by_name(job_name):
-        j.schedule_removal()
+    if remaining <= 0:
+        await query.answer("Too many wrong attempts.", show_alert=True)
+        if KICK_ON_TOO_MANY_WRONG:
+            await _kick_user(chat_id, target_user_id, context)
+        PENDING.pop(k, None)
+        try:
+            await query.edit_message_caption(
+                caption="Verification failed. Please re-join and try again.",
+                reply_markup=_build_verified_keyboard(),
+            )
+        except Exception:
+            pass
+        return
 
-    # Update the welcome message to reflect success (optional)
+    # Rotate challenge after wrong attempt (makes brute-force harder)
+    pv.token = secrets.token_hex(4)
+    pv.correct_index = secrets.randbelow(len(CAPTCHA_ICONS))
+    required_icon = CAPTCHA_ICONS[pv.correct_index]
+
+    await query.answer(f"Wrong button. Try again. Attempts left: {remaining}", show_alert=True)
+
+    # Update caption + refreshed keyboard with new token and requirement
     try:
-        # Keep same links but remove Verify button
-        verified_markup = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Paycheck Website", url=PAYCHECK_WEBSITE),
-                InlineKeyboardButton("Paycheck X", url=PAYCHECK_X),
-            ],
-            [InlineKeyboardButton("Paycheck Medium", url=PAYCHECK_MEDIUM)],
-        ])
         await query.edit_message_caption(
-            caption="Verified ✅ Welcome in!",
-            reply_markup=verified_markup,
+            caption=_welcome_caption(clicker.first_name or "there", required_icon),
+            reply_markup=_build_keyboard(chat_id, target_user_id, pv.token, required_icon),
         )
     except Exception:
         pass
 
 
 def register_welcome_gate_handlers(application) -> None:
-    """
-    Call this from your main bot setup.
-    """
     application.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
-    application.add_handler(CallbackQueryHandler(on_verify_button, pattern=f"^{CB_VERIFY_PREFIX}"))
+    application.add_handler(CallbackQueryHandler(on_verify_captcha, pattern=f"^{CB_VERIFY_PREFIX}"))
