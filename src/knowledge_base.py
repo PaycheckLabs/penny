@@ -7,6 +7,7 @@ Goal:
   - Company info (Paycheck Labs)
   - Penny assistant info (how to use, testing group norms)
   - Official links
+  - High-level product references (with clear "planned vs in development" labels)
 
 This is intentionally lightweight for MVP:
 - No database
@@ -33,6 +34,14 @@ PAYCHECK_LINKS: Dict[str, str] = {
     "Paycheck Medium": "https://medium.com/@paycheck",
 }
 
+# Product / documentation links (high-level)
+PRODUCT_LINKS: Dict[str, str] = {
+    # Provided by you as the key canonical domain for Checks documentation
+    "Checks Website": "https://checks.xyz/",
+    # Whitepaper URL can vary. We reference it as "on checks.xyz" instead of guessing a path.
+    "Checks Whitepaper": "See the Whitepaper on checks.xyz",
+}
+
 
 # -----------------------------
 # Knowledge base sections
@@ -52,9 +61,8 @@ KB_SECTIONS: List[KBSection] = [
         title="Paycheck Labs overview",
         keywords=("paycheck labs", "paycheck", "company", "team", "about", "who built you", "who made you"),
         content=(
-            "Paycheck Labs is the team building Penny, an AI virtual assistant.\n"
-            "Penny is being developed and tested in Telegram first, with features expanding over time.\n"
-            "For official updates and posts, use the links in the buttons below."
+            "Paycheck Labs is the team building Penny and other blockchain and AI projects.\n"
+            "The fastest way to get official details is the website and the News page."
         ),
     ),
     KBSection(
@@ -113,12 +121,77 @@ KB_SECTIONS: List[KBSection] = [
             f"• Medium: {PAYCHECK_LINKS['Paycheck Medium']}"
         ),
     ),
+
+    # -----------------------------
+    # Products and initiatives (high-level)
+    # -----------------------------
+    KBSection(
+        id="paychain_planned",
+        title="Paychain blockchain (planned)",
+        keywords=("paychain", "layer 1", "l1", "payments network", "block explorer", "payscan", "virtual machine", "pvm"),
+        content=(
+            "Paychain is a planned future blockchain initiative focused on payments and tokenization.\n"
+            "It is described as a custom Layer 1 network, with supporting components like a block explorer."
+        ),
+    ),
+    KBSection(
+        id="checks_platform_dev",
+        title="Checks Platform (in development)",
+        keywords=("checks", "checks platform", "nft checks", "check token", "check token $check", "protocol", "checks.xyz", "whitepaper"),
+        content=(
+            "The Checks Platform is in development and centers around NFT Checks, which are programmable financial agreements.\n"
+            "For the most accurate and complete product info, use the canonical docs and Whitepaper on:\n"
+            f"• {PRODUCT_LINKS['Checks Website']}"
+        ),
+    ),
+    KBSection(
+        id="tech_foundation",
+        title="Technology foundation",
+        keywords=("technology", "tech", "stack", "ai", "artificial intelligence", "llm", "machine learning", "oracles", "zk", "zero-knowledge", "encryption", "mpc", "did", "soulbound", "nft"),
+        content=(
+            "Paycheck Labs references a technology foundation spanning blockchain and AI.\n"
+            "Examples mentioned include smart contract systems, AI and large language models, machine learning, and privacy/security primitives.\n"
+            "Details evolve, so use the website for the latest descriptions."
+        ),
+    ),
+
+    # -----------------------------
+    # FAQ / News / Associate Program
+    # -----------------------------
+    KBSection(
+        id="faq_help",
+        title="FAQ on the website",
+        keywords=("faq", "frequently asked", "questions", "what is paycheck labs", "security", "secure", "benefit my business"),
+        content=(
+            "The Paycheck website includes an FAQ section.\n"
+            "If you want official phrasing for questions about what Paycheck Labs is, how blockchain can help, or security posture, "
+            "the FAQ is the best source."
+        ),
+    ),
+    KBSection(
+        id="news_updates",
+        title="News updates",
+        keywords=("news", "updates", "latest", "announcements", "release", "listing", "launch"),
+        content=(
+            "Official announcements and updates can be found on the Paycheck website’s News section.\n"
+            "For quick links, use the buttons below, and check the News page for the latest posts."
+        ),
+    ),
+    KBSection(
+        id="associate_program",
+        title="Paycheck Labs Associate Program (ASC)",
+        keywords=("associate", "associate program", "asc", "workforce", "apply", "sign up", "rewards", "benefits"),
+        content=(
+            "Paycheck Labs has an Associate Program (often shortened to ASC).\n"
+            "People can read about the program on the website and apply to become an associate."
+        ),
+    ),
     KBSection(
         id="roadmap_hint",
         title="What’s coming next",
-        keywords=("roadmap", "next", "coming", "soon", "plans", "knowledge base", "price", "crypto"),
+        keywords=("roadmap", "next", "coming", "soon", "plans", "knowledge base", "price", "crypto", "api"),
         content=(
-            "Planned upgrades include a Paycheck Labs knowledge base, richer help commands, and API features "
+            "Planned upgrades include expanding the Paycheck Labs knowledge base, richer commands, and API features "
             "like crypto price checks.\n"
             "We’re building step by step and validating everything in the testing group."
         ),
@@ -147,7 +220,6 @@ def find_relevant_sections(user_text: str, max_sections: int = 3) -> List[KBSect
         for kw in sec.keywords:
             if kw in t:
                 score += 2
-        # small boost if section title words appear
         for w in sec.title.lower().split():
             if w and w in t:
                 score += 1
