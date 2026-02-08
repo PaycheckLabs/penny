@@ -1,12 +1,12 @@
 import os
+import re
 import logging
 from collections import defaultdict, deque
 from typing import Deque, Dict, List, Optional, Tuple
 
-from telegram import Update, Message
+from telegram import Update
 from telegram.constants import ChatType
 from telegram.ext import (
-    Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
@@ -16,273 +16,313 @@ from telegram.ext import (
 
 from openai import OpenAI
 
-# -----------------------------
+# ----------------------------
 # Logging
-# -----------------------------
+# ----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-log = logging.getLogger("penny")
+logger = logging.getLogger("penny")
 
-# -----------------------------
-# Env / Config
-# -----------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# ----------------------------
+# Environment
+# ----------------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")  # you can change later
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "280"))
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano").strip()
-OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "320"))
+# Bot mention / command triggers (customize if you want)
+BOT_MENTION = os.getenv("BOT_MENTION", "@HeyPennyBot").strip()  # must include "@"
+BOT_COMMAND = os.getenv("BOT_COMMAND", "/penny").strip()        # must include "/"
 
-PENNY_NAME = os.getenv("PENNY_NAME", "Penny").strip()
-BOT_MENTION = os.getenv("BOT_MENTION", "@HeyPennyBot").strip()      # include "@"
-BOT_USERNAME = os.getenv("BOT_USERNAME", "HeyPennyBot").strip()     # no "@"
-PENNY_COMMAND = "/penny"
+# Optional: test group forwarding feature
+PENNY_TEST_CHAT_ID = os.getenv("PENNY_TEST_CHAT_ID", "").strip()  # e.g. "-1001234567890"
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ----------------------------
+# Simple in-memory chat history (short-term memory)
+# NOTE: this resets if Railway restarts the container.
+# ----------------------------
+MAX_TURNS = 10  # total messages stored per chat (user+assistant). Keep small for cost.
+CHAT_MEMORY: Dict[Tuple[int, Optional[int]], Deque[dict]] = defaultdict(lambda: deque(maxlen=MAX_TURNS))
 
-# -----------------------------
-# System prompt (compact + human)
-# -----------------------------
-SYSTEM_PREAMBLE = f"""
-You are {PENNY_NAME}, a friendly, concise AI assistant.
+# Key: (chat_id, topic_thread_id) so topics in groups stay separate
+def memory_key(update: Update) -> Tuple[int, Optional[int]]:
+    chat_id = update.effective_chat.id
+    thread_id = getattr(update.effective_message, "message_thread_id", None)
+    return (chat_id, thread_id)
 
-Tone and format:
-- Keep replies short by default (1–6 lines). Expand only if asked.
-- Sound human, warm, and conversational.
-- No em dashes. Use normal punctuation.
-- If the user is vague, ask one helpful follow-up question.
-- Avoid long lists unless the user asks for lists.
+# ----------------------------
+# System prompt (personality + rules)
+# ----------------------------
+SYSTEM_PREAMBLE = """
+You are Penny, a friendly, practical AI assistant.
+Write like a helpful human. Keep responses short by default (2 to 6 sentences).
+Do not use em dashes.
+Be conversational and supportive. When it helps, ask one short follow-up question.
 
-Brand rules:
-- Do not bring up payroll, paychecks, HR, taxes, W-2s, or similar.
-- Do not mention Paycheck Labs unless the user asks who made you or asks about the company.
-- If asked about Paycheck Labs, answer briefly and offer to share more.
+Do not mention Paycheck Labs or payroll/paychecks in casual conversation.
+Only mention Paycheck Labs if the user asks who created you, what you are, or asks about the company directly.
+If the user asks about Paycheck Labs, answer briefly and factually.
 
-Safety:
-- Refuse harmful requests briefly and redirect to safer help.
+If the user asks for harmful, illegal, or unsafe instructions, refuse politely and suggest a safer alternative.
+
+If the user says "yes" or "show me" or "do it" after you offered options, continue the same thread using the existing context.
 """.strip()
 
-# -----------------------------
-# In-memory history (lightweight)
-# -----------------------------
-# Per-chat rolling window (resets if Railway restarts)
-HISTORY: Dict[int, Deque[dict]] = defaultdict(lambda: deque(maxlen=14))
+# ----------------------------
+# Helpers
+# ----------------------------
+def is_private_chat(update: Update) -> bool:
+    chat = update.effective_chat
+    return chat and chat.type == ChatType.PRIVATE
 
-def add_history(chat_id: int, role: str, content: str) -> None:
-    content = (content or "").strip()
-    if content:
-        HISTORY[chat_id].append({"role": role, "content": content})
+def bot_user_id(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    try:
+        return context.bot.id
+    except Exception:
+        return None
 
-# -----------------------------
-# Trigger rules
-# -----------------------------
-def is_private(update: Update) -> bool:
-    return bool(update.effective_chat and update.effective_chat.type == ChatType.PRIVATE)
+def should_respond_in_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[bool, str]:
+    """
+    Group rules:
+    1) User starts message with /penny
+    2) User starts message with @HeyPennyBot (or BOT_MENTION)
+    3) User replies to a message that Penny posted
+    """
+    msg = update.effective_message
+    if not msg:
+        return (False, "")
 
-def starts_with_trigger(text: str) -> bool:
-    t = (text or "").lstrip()
-    if not t:
-        return False
-    low = t.lower()
-    return low.startswith(PENNY_COMMAND) or low.startswith(BOT_MENTION.lower()) or low.startswith(BOT_USERNAME.lower())
+    text = (msg.text or msg.caption or "").strip()
+    if not text and not msg.reply_to_message:
+        return (False, "")
 
-def strip_trigger_prefix(text: str) -> str:
-    t = (text or "").strip()
-    if not t:
-        return t
+    # Case 3: reply to Penny
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        if msg.reply_to_message.from_user.id == bot_user_id(context):
+            # In replies, we should use the user's text as-is (no prefix needed)
+            return (True, text)
 
-    low = t.lower()
+    # Case 1: /penny prefix
+    if text.lower().startswith(BOT_COMMAND.lower()):
+        cleaned = text[len(BOT_COMMAND):].strip()
+        return (True, cleaned)
 
-    if low.startswith(PENNY_COMMAND):
-        t = t[len(PENNY_COMMAND):].strip()
-        low = t.lower()
+    # Case 2: @HeyPennyBot prefix
+    if BOT_MENTION and text.lower().startswith(BOT_MENTION.lower()):
+        cleaned = text[len(BOT_MENTION):].strip()
+        return (True, cleaned)
 
-    if low.startswith(BOT_MENTION.lower()):
+    return (False, "")
+
+def strip_leading_triggers(text: str) -> str:
+    t = text.strip()
+    if t.lower().startswith(BOT_COMMAND.lower()):
+        t = t[len(BOT_COMMAND):].strip()
+    if BOT_MENTION and t.lower().startswith(BOT_MENTION.lower()):
         t = t[len(BOT_MENTION):].strip()
-        low = t.lower()
+    return t
 
-    if low.startswith(BOT_USERNAME.lower()):
-        t = t[len(BOT_USERNAME):].strip()
+def normalize_whitespace(s: str) -> str:
+    return re.sub(r"[ \t]+\n", "\n", re.sub(r"\n{3,}", "\n\n", s)).strip()
 
-    if t.startswith(":"):
-        t = t[1:].strip()
-
-    return t.strip()
-
-def replied_to_bot(msg: Message) -> bool:
-    if not msg.reply_to_message:
-        return False
-    r = msg.reply_to_message
-    if r.from_user and r.from_user.is_bot:
-        return True
-    # Sometimes is_bot can be inconsistent; try username match too
-    if r.from_user and r.from_user.username:
-        return r.from_user.username.lower() == BOT_USERNAME.lower()
-    return False
-
-def should_respond(update: Update) -> Tuple[bool, Optional[str]]:
+def build_input_with_memory(key: Tuple[int, Optional[int]], user_text: str) -> List[dict]:
     """
-    Returns (should_respond, replied_text_if_any)
-    Group rules: respond only if:
-      1) starts with /penny
-      2) starts with @HeyPennyBot (or HeyPennyBot)
-      3) reply to Penny's message
-    DM rules: respond to any text.
+    Build an input list for the Responses API that includes system + recent memory.
     """
-    msg = update.message
-    if not msg or not msg.text:
-        return False, None
+    history = list(CHAT_MEMORY[key])
+    msgs = [{"role": "system", "content": SYSTEM_PREAMBLE}]
+    msgs.extend(history)
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
 
-    if is_private(update):
-        return True, None
-
-    if starts_with_trigger(msg.text):
-        return True, None
-
-    if replied_to_bot(msg):
-        replied_text = msg.reply_to_message.text or msg.reply_to_message.caption or ""
-        return True, replied_text.strip() or None
-
-    return False, None
-
-# -----------------------------
-# OpenAI helpers
-# -----------------------------
-def extract_text(resp) -> str:
+def extract_output_text(resp) -> str:
     """
-    Robustly extract text from Responses API result.
+    Prefer response.output_text, but fall back to scanning common structures.
     """
-    txt = getattr(resp, "output_text", None)
-    if isinstance(txt, str) and txt.strip():
-        return txt.strip()
+    try:
+        t = getattr(resp, "output_text", None)
+        if isinstance(t, str) and t.strip():
+            return t.strip()
+    except Exception:
+        pass
 
-    out = getattr(resp, "output", None)
-    if isinstance(out, list):
-        parts: List[str] = []
-        for item in out:
-            content = getattr(item, "content", None)
-            if isinstance(content, list):
-                for c in content:
-                    ctype = getattr(c, "type", "")
-                    if ctype in ("output_text", "text"):
-                        val = getattr(c, "text", None) or getattr(c, "value", None)
-                        if isinstance(val, str) and val.strip():
-                            parts.append(val.strip())
-        joined = "\n".join(parts).strip()
-        if joined:
-            return joined
+    # Fallback: try dict-like access
+    try:
+        data = resp.model_dump() if hasattr(resp, "model_dump") else resp
+        # Look for output_text key
+        if isinstance(data, dict):
+            t = data.get("output_text")
+            if isinstance(t, str) and t.strip():
+                return t.strip()
+            # Search nested output -> content -> text
+            out = data.get("output", [])
+            if isinstance(out, list):
+                chunks = []
+                for item in out:
+                    content = item.get("content", []) if isinstance(item, dict) else []
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "output_text":
+                            chunks.append(c.get("text", ""))
+                        elif isinstance(c, dict) and "text" in c:
+                            chunks.append(c.get("text", ""))
+                joined = "\n".join([x for x in chunks if isinstance(x, str) and x.strip()]).strip()
+                if joined:
+                    return joined
+    except Exception:
+        pass
 
     return ""
 
-def call_llm(chat_id: int, user_text: str, replied_to_text: Optional[str]) -> str:
-    messages: List[dict] = [{"role": "system", "content": SYSTEM_PREAMBLE}]
-    if HISTORY[chat_id]:
-        messages.extend(list(HISTORY[chat_id]))
+async def call_llm(key: Tuple[int, Optional[int]], user_text: str) -> str:
+    if not client:
+        return "I am not configured yet. The OpenAI key is missing on the server."
 
-    # If user replied to Penny, inject that as the previous assistant message
-    if replied_to_text:
-        messages.append({"role": "assistant", "content": replied_to_text})
-
-    messages.append({"role": "user", "content": user_text})
-
-    log.info("OpenAI call | chat_id=%s | model=%s | user_len=%s", chat_id, OPENAI_MODEL, len(user_text))
-
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        input=messages,
-        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
-    )
-    return extract_text(resp)
-
-# -----------------------------
-# Telegram handlers
-# -----------------------------
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Hi. I’m {PENNY_NAME}. How can I help?")
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "In groups, I respond when:\n"
-        f"- You start with {PENNY_COMMAND}\n"
-        f"- You start with {BOT_MENTION}\n"
-        "- You reply to one of my messages\n\n"
-        "In DMs, you can just type normally."
-    )
-
-async def penny_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /penny <message> command handler.
-    Works in DMs and groups.
-    """
-    msg = update.message
-    args_text = " ".join(context.args).strip() if context.args else ""
-    if not args_text:
-        await msg.reply_text("Hey. What can I help with?")
-        return
-
-    # Treat this exactly like a triggered message
-    await handle_message(update, context, forced_text=args_text, replied_text=None)
-
-async def handle_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    forced_text: Optional[str] = None,
-    replied_text: Optional[str] = None,
-):
-    msg = update.message
-    chat_id = update.effective_chat.id
+    messages = build_input_with_memory(key, user_text)
 
     try:
-        incoming = forced_text if forced_text is not None else (msg.text or "")
-        cleaned = strip_trigger_prefix(incoming)
-
-        if not cleaned:
-            await msg.reply_text("Hey. What can I help with?")
-            return
-
-        add_history(chat_id, "user", cleaned)
-
-        answer = call_llm(chat_id, cleaned, replied_text)
-
-        if not answer:
-            await msg.reply_text("I didn’t get a response back. Try again.")
-            return
-
-        add_history(chat_id, "assistant", answer)
-        await msg.reply_text(answer)
-
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            input=messages,
+            max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+        )
+        text = extract_output_text(resp)
+        return normalize_whitespace(text)
     except Exception as e:
-        log.exception("LLM error: %s", e)
-        await msg.reply_text("I hit an error calling the model. Check Railway logs and your OPENAI settings.")
+        logger.exception("OpenAI call failed")
+        return "I hit an error calling the language model. Check Railway logs and your OPENAI settings."
 
-async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok, replied_text = should_respond(update)
-    if not ok:
+def remember_turn(key: Tuple[int, Optional[int]], user_text: str, assistant_text: str) -> None:
+    if user_text.strip():
+        CHAT_MEMORY[key].append({"role": "user", "content": user_text.strip()})
+    if assistant_text.strip():
+        CHAT_MEMORY[key].append({"role": "assistant", "content": assistant_text.strip()})
+
+# ----------------------------
+# Commands
+# ----------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Hi. How can I help?")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Quick commands:\n"
+        f"- {BOT_COMMAND} <message>\n"
+        f"- {BOT_MENTION} <message>\n"
+        "- Reply to me in a chat to continue the thread\n"
+        "\nIn DMs, you can just type normally."
+    )
+
+async def penny_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /penny <text> - always allowed
+    msg = update.effective_message
+    text = (msg.text or "").strip()
+    user_text = text[len(BOT_COMMAND):].strip() if text.lower().startswith(BOT_COMMAND.lower()) else ""
+    if not user_text:
+        await msg.reply_text("Yep. What do you want to talk about?")
         return
 
-    await handle_message(update, context, forced_text=None, replied_text=replied_text)
+    key = memory_key(update)
+    answer = await call_llm(key, user_text)
+    if not answer:
+        answer = "I did not get a response back. Try again."
 
-def build_app() -> Application:
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    remember_turn(key, user_text, answer)
+    await msg.reply_text(answer)
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("penny", penny_cmd))
+async def posttestcaption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /posttestcaption <caption>
+    Sends the caption to the test group. (Optional)
+    """
+    msg = update.effective_message
+    if not msg:
+        return
 
-    # All normal text flows through the router
-    app.add_handler(MessageHandler(filters.TEXT, message_router))
+    if not PENNY_TEST_CHAT_ID:
+        await msg.reply_text("PENNY_TEST_CHAT_ID is not set on the server.")
+        return
 
-    return app
+    text = (msg.text or "").strip()
+    caption = text.replace("/posttestcaption", "", 1).strip()
+    if not caption:
+        await msg.reply_text("Usage: /posttestcaption <caption>")
+        return
+
+    try:
+        await context.bot.send_message(chat_id=PENNY_TEST_CHAT_ID, text=caption)
+        await msg.reply_text("Posted to the test group.")
+    except Exception:
+        logger.exception("posttestcaption failed")
+        await msg.reply_text("I could not post to the test group. Check Railway logs.")
+
+# ----------------------------
+# Main message handler
+# ----------------------------
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+
+    raw_text = (msg.text or msg.caption or "").strip()
+    if not raw_text and not msg.reply_to_message:
+        return
+
+    # Decide if we should respond
+    if is_private_chat(update):
+        # In DMs, respond to any text.
+        # Still allow the user to include /penny or @HeyPennyBot, we strip it.
+        user_text = strip_leading_triggers(raw_text)
+        if not user_text:
+            await msg.reply_text("Hey. How can I help?")
+            return
+    else:
+        # In groups/supergroups: respond only if triggered
+        ok, extracted = should_respond_in_group(update, context)
+        if not ok:
+            return
+        user_text = extracted if extracted else ""
+        user_text = strip_leading_triggers(user_text)
+        if not user_text:
+            await msg.reply_text("Yep. What do you need?")
+            return
+
+    # Small friendly fast-path for greetings (keeps it human and short)
+    lower = user_text.lower()
+    if lower in {"hi", "hello", "hey", "yo", "sup", "gm", "good morning", "good evening"}:
+        await msg.reply_text("Hey. How can I help?")
+        return
+
+    # Call LLM with short-term memory
+    key = memory_key(update)
+    answer = await call_llm(key, user_text)
+
+    if not answer:
+        answer = "I did not get a response back. Try again."
+
+    remember_turn(key, user_text, answer)
+    await msg.reply_text(answer)
 
 def main():
-    app = build_app()
-    log.info("Penny running. model=%s mention=%s username=%s", OPENAI_MODEL, BOT_MENTION, BOT_USERNAME)
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("penny", penny_command))
+    app.add_handler(CommandHandler("posttestcaption", posttestcaption))
+
+    # Text handler (non-command text)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    logger.info("Penny is running...")
     app.run_polling()
 
 if __name__ == "__main__":
