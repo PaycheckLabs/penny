@@ -1,218 +1,186 @@
+# src/bot.py
 import os
 import re
 import time
+import json
 import logging
-from collections import defaultdict, deque
-from typing import Deque, Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
-from telegram import Update, Message
+from openai import OpenAI
+
+from telegram import Update
 from telegram.constants import ChatType
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-from openai import OpenAI
-from welcome_gate import register_welcome_gate_handlers
-
-# NEW: Paycheck Labs knowledge base (lightweight retrieval)
+# Existing KB helper
 from knowledge_base import build_kb_context
-from answer import openai_reply as answer_openai_reply
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+# NEW: Docs excerpt helper (synced whitepaper/docs)
+from answer import build_checks_context
+
+logger = logging.getLogger("penny")
+logging.basicConfig(level=logging.INFO)
+
+# ----------------------------
+# ENV
+# ----------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
+BOT_TRIGGER = os.getenv("BOT_TRIGGER", "penny").lower()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "") or os.getenv("api_key", "") or os.getenv("OPENAI", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "500"))
+
+# Admin controls
+ADMIN_IDS = set()
+_raw_admin = os.getenv("ADMIN_IDS", "").strip()
+if _raw_admin:
+    for part in _raw_admin.split(","):
+        part = part.strip()
+        if part.isdigit():
+            ADMIN_IDS.add(int(part))
+
+# Testing group target (optional)
+TESTING_GROUP_ID = os.getenv("TESTING_GROUP_ID", "").strip()
+if TESTING_GROUP_ID and TESTING_GROUP_ID.lstrip("-").isdigit():
+    TESTING_GROUP_ID = int(TESTING_GROUP_ID)
+else:
+    TESTING_GROUP_ID = None
+
+# NEW: Where the synced docs live (comma-separated, relative to repo root)
+# From your screenshots, docs/ contains the synced markdown.
+CHECKS_DOCS_DIRS = os.getenv("CHECKS_DOCS_DIRS", "docs,src/data/checks_whitepaper,src/data/checks_whitepaper/docs")
+CHECKS_DOCS_MAX_CHARS = int(os.getenv("CHECKS_DOCS_MAX_CHARS", "6500"))
+
+# ----------------------------
+# OpenAI client
+# ----------------------------
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ----------------------------
+# System prompt
+# ----------------------------
+SYSTEM_PROMPT = (
+    "You are Penny, the official AI advisor for Paycheck Labs.\n"
+    "You provide product guidance, community operations support, and educational explanations.\n"
+    "Tone: calm, precise, protective. Prioritize clarity and correct process over hype.\n"
+    "If you are unsure, say so and suggest the next best step.\n"
 )
-logger = logging.getLogger("penny-bot")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano").strip()
-OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "260").strip())
+# ----------------------------
+# Memory (simple in-process)
+# ----------------------------
+MAX_MEMORY_TURNS = 6
+_memory: Dict[str, List[Dict[str, str]]] = {}
 
-BOT_USERNAME = os.getenv("BOT_USERNAME", "HeyPennyBot").strip().lstrip("@")
-BOT_TRIGGER = (os.getenv("BOT_TRIGGER") or os.getenv("COMMAND_TRIGGER") or "/penny").strip()
-
-# NEW INPUT 1: where the synced Checks whitepaper/docs live in this repo
-CHECKS_DOCS_DIR = os.getenv("CHECKS_DOCS_DIR", "docs/data/checks_whitepaper").strip()
-
-# NEW INPUT 2: how many KB sections to inject (keep small for token cost + relevance)
-CHECKS_KB_MAX_SECTIONS = int(os.getenv("CHECKS_KB_MAX_SECTIONS", "4").strip())
-
-def _parse_int_env(name: str, default: int = 0) -> int:
-    raw = (os.getenv(name, "") or "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-def _parse_admin_ids() -> set[int]:
-    raw = (os.getenv("ADMIN_USER_IDS", "") or "").strip()
-    if not raw:
-        return set()
-    parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
-    out: set[int] = set()
-    for p in parts:
-        try:
-            out.add(int(p))
-        except ValueError:
-            continue
-    return out
-
-TEST_GROUP_CHAT_ID = _parse_int_env("PENNY_TEST_CHAT_ID", 0)
-if not TEST_GROUP_CHAT_ID:
-    TEST_GROUP_CHAT_ID = _parse_int_env("TEST_GROUP_CHAT_ID", 0)
-
-ADMIN_IDS = _parse_admin_ids()
-single_admin = _parse_int_env("ADMIN_TELEGRAM_USER_ID", 0)
-if single_admin:
-    ADMIN_IDS.add(single_admin)
-
-ENV = os.getenv("ENV", "production").strip()
-
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-
-client = OpenAI(api_key=OPENAI_API_KEY if OPENAI_API_KEY else None)
-
-# -------------------------
-# Conversation Memory
-# -------------------------
-MEMORY_TURNS = 10
-memory: Dict[Tuple[int, int], Deque[Dict[str, str]]] = defaultdict(lambda: deque(maxlen=MEMORY_TURNS * 2))
-
-def add_to_memory(chat_id: int, user_id: int, role: str, content: str) -> None:
-    memory[(chat_id, user_id)].append({"role": role, "content": content})
+def _mem_key(chat_id: int, user_id: int) -> str:
+    return f"{chat_id}:{user_id}"
 
 def get_memory(chat_id: int, user_id: int) -> List[Dict[str, str]]:
-    return list(memory[(chat_id, user_id)])
+    return _memory.get(_mem_key(chat_id, user_id), [])[-(MAX_MEMORY_TURNS * 2):]
 
-# -------------------------
-# NEW: DM media stash for /posttestcaption
-# -------------------------
-DM_MEDIA_TTL_SECONDS = int(os.getenv("DM_MEDIA_TTL_SECONDS", "900"))  # 15 minutes
-_last_dm_media: Dict[int, Dict[str, str]] = {}  # user_id -> {"type": "photo|animation", "file_id": "...", "ts": "..."}
+def add_memory(chat_id: int, user_id: int, role: str, content: str) -> None:
+    key = _mem_key(chat_id, user_id)
+    _memory.setdefault(key, []).append({"role": role, "content": content})
+    _memory[key] = _memory[key][-(MAX_MEMORY_TURNS * 2):]
 
-def _stash_dm_media(user_id: int, media_type: str, file_id: str) -> None:
-    _last_dm_media[user_id] = {"type": media_type, "file_id": file_id, "ts": str(int(time.time()))}
-
-def _pop_recent_dm_media(user_id: int) -> Optional[Dict[str, str]]:
-    data = _last_dm_media.get(user_id)
-    if not data:
-        return None
-    try:
-        ts = int(data.get("ts", "0"))
-    except ValueError:
-        ts = 0
-    if time.time() - ts > DM_MEDIA_TTL_SECONDS:
-        _last_dm_media.pop(user_id, None)
-        return None
-    # keep it for reuse, do NOT pop by default
-    return data
-
-SYSTEM_PROMPT = (
-    "You are Penny, a helpful, friendly general-purpose AI assistant in Telegram.\n"
-    "Style rules:\n"
-    "- Be concise and conversational. Prefer 1 to 6 short sentences.\n"
-    "- No em dashes. Use simple punctuation.\n"
-    "- Ask a brief follow-up question when it helps.\n"
-    "- Do not mention payroll, paychecks, or HR services.\n"
-    "- Do not mention Paycheck Labs unless the user asks who made you or asks about the company.\n"
-    "- If the user asks about who created you: say you were created by Paycheck Labs.\n"
-    "- If the user asks unsafe or disallowed content, refuse briefly and offer a safer alternative.\n"
-    "Math rule:\n"
-    "- If the user asks for steps, show steps. If they ask for only the answer, give only the answer.\n"
-)
-
-GREETING_RE = re.compile(r"^(hi|hello|hey|yo|sup|what'?s up|good morning|good afternoon|good evening)\b", re.I)
-
-def is_reply_to_penny(msg: Message) -> bool:
-    if not msg.reply_to_message:
-        return False
-    ru = msg.reply_to_message.from_user
-    if not ru:
-        return False
-    if ru.is_bot and (ru.username or "").lower() == BOT_USERNAME.lower():
-        return True
-    return False
-
-def starts_with_mention(text: str) -> bool:
-    if not text:
-        return False
-    t = text.strip()
-    return t.lower().startswith(f"@{BOT_USERNAME}".lower())
-
-def starts_with_trigger(text: str) -> bool:
-    if not text:
-        return False
-    return text.strip().lower().startswith(BOT_TRIGGER.lower())
-
-def strip_trigger_prefix(text: str) -> str:
-    if not text:
-        return ""
-    t = text.strip()
-    if starts_with_trigger(t):
-        return t[len(BOT_TRIGGER):].strip()
-    if starts_with_mention(t):
-        return t[len(f"@{BOT_USERNAME}") :].strip()
-    return t
-
-def should_respond(update: Update) -> bool:
-    msg = update.message
-    if not msg or not msg.text:
-        return False
-    if msg.from_user and msg.from_user.is_bot:
-        return False
-    chat_type = msg.chat.type
-    text = msg.text.strip()
-    if chat_type == ChatType.PRIVATE:
-        return True
-    if starts_with_trigger(text) or starts_with_mention(text) or is_reply_to_penny(msg):
-        return True
-    return False
-
+# ----------------------------
+# Utilities
+# ----------------------------
 def extract_output_text(resp) -> str:
+    """
+    Robust extraction for Responses API.
+    """
     try:
-        out = ""
-        for item in getattr(resp, "output", []) or []:
-            content_list = getattr(item, "content", None)
-            if not content_list:
-                continue
-            for c in content_list:
-                t = getattr(c, "text", None)
-                if t:
-                    out += t
-        return out.strip()
+        if hasattr(resp, "output_text") and resp.output_text:
+            return resp.output_text.strip()
+    except Exception:
+        pass
+
+    try:
+        out = []
+        for item in resp.output:
+            if getattr(item, "type", None) == "message":
+                for c in getattr(item, "content", []) or []:
+                    if getattr(c, "type", None) == "output_text":
+                        out.append(getattr(c, "text", ""))
+        text = "\n".join([t for t in out if t]).strip()
+        return text
     except Exception:
         return ""
 
+def should_respond(message_text: str, is_reply_to_bot: bool) -> bool:
+    """
+    In groups: respond if trigger word, @mention, or reply-to-bot.
+    In DMs: always respond.
+    """
+    if not message_text:
+        return False
+
+    txt = message_text.strip()
+    low = txt.lower()
+
+    if is_reply_to_bot:
+        return True
+
+    if BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in low:
+        return True
+
+    if low.startswith(BOT_TRIGGER + " "):
+        return True
+    if low == BOT_TRIGGER:
+        return True
+
+    return False
+
+def strip_trigger_prefix(message_text: str) -> str:
+    txt = message_text.strip()
+    low = txt.lower()
+    if low.startswith(BOT_TRIGGER + " "):
+        return txt[len(BOT_TRIGGER) + 1 :].strip()
+    if low == BOT_TRIGGER:
+        return ""
+    return txt
+
+# ----------------------------
+# Message builder (CORE)
+# ----------------------------
 def build_messages(chat_id: int, user_id: int, user_text: str) -> List[Dict[str, str]]:
     msgs: List[Dict[str, str]] = [{"role": "developer", "content": SYSTEM_PROMPT}]
 
-    # NEW: inject KB context only when relevant
-    # We try calling build_kb_context with docs_dir if supported.
-    kb_context = ""
-    try:
-        kb_context = build_kb_context(user_text, docs_dir=CHECKS_DOCS_DIR, max_sections=CHECKS_KB_MAX_SECTIONS)
-    except TypeError:
-        # Fallback for older signature
-        kb_context = build_kb_context(user_text, max_sections=CHECKS_KB_MAX_SECTIONS)
-    except Exception as e:
-        logger.warning("KB context build failed: %r", e)
-        kb_context = ""
-
+    # Existing: inject KB context (only when relevant)
+    kb_context = build_kb_context(user_text, max_sections=3)
     if kb_context:
         msgs.append({"role": "developer", "content": kb_context})
 
+    # NEW: inject Checks docs excerpts (only when relevant)
+    # This is what makes "Auto-Investment" and other roadmap features discoverable.
+    dirs = [d.strip() for d in CHECKS_DOCS_DIRS.split(",") if d.strip()]
+    docs_context = build_checks_context(
+        user_text=user_text,
+        dirs=dirs,
+        max_chars=CHECKS_DOCS_MAX_CHARS,
+    )
+    if docs_context:
+        msgs.append({"role": "developer", "content": docs_context})
+
+    # Memory
     msgs.extend(get_memory(chat_id, user_id))
+
+    # User
     msgs.append({"role": "user", "content": user_text})
     return msgs
 
+# ----------------------------
+# OpenAI call
+# ----------------------------
 def openai_reply(chat_id: int, user_id: int, user_text: str) -> Tuple[Optional[str], Optional[str]]:
     messages = build_messages(chat_id, user_id, user_text)
     last_err = None
@@ -235,6 +203,9 @@ def openai_reply(chat_id: int, user_id: int, user_text: str) -> Tuple[Optional[s
             time.sleep(0.6)
     return None, last_err
 
+# ----------------------------
+# Telegram handlers
+# ----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Hi. How can I help?")
 
@@ -249,6 +220,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # Stash last DM media (photo or GIF) for later posting
+_dm_media_stash: Dict[int, Dict[str, str]] = {}
+
+def _stash_dm_media(user_id: int, media_type: str, file_id: str) -> None:
+    _dm_media_stash[user_id] = {"type": media_type, "file_id": file_id}
+
+def _pop_dm_media(user_id: int) -> Optional[Dict[str, str]]:
+    return _dm_media_stash.pop(user_id, None)
+
 async def stash_dm_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or msg.chat.type != ChatType.PRIVATE or not msg.from_user:
@@ -282,106 +261,99 @@ async def post_test_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Not authorized.")
         return
 
-    if not TEST_GROUP_CHAT_ID:
-        await msg.reply_text("PENNY_TEST_CHAT_ID is not set in Railway variables.")
-        return
-
     caption = " ".join(context.args).strip() if context.args else ""
     if not caption:
-        await msg.reply_text("Usage:\n/posttestcaption <your caption text>")
+        await msg.reply_text("Usage: /posttestcaption <caption text>")
         return
 
-    user_id = msg.from_user.id if msg.from_user else 0
-    media = _pop_recent_dm_media(user_id)
+    if not TESTING_GROUP_ID:
+        await msg.reply_text("TESTING_GROUP_ID is not set.")
+        return
+
+    if not msg.from_user:
+        await msg.reply_text("Missing user.")
+        return
+
+    stashed = _pop_dm_media(msg.from_user.id)
+    if not stashed:
+        await msg.reply_text("I don't have any recent photo/GIF from you. Send me an image (or GIF) first, then run /posttestcaption.")
+        return
+
+    media_type = stashed.get("type")
+    file_id = stashed.get("file_id")
 
     try:
-        if media and media.get("type") == "photo":
-            await context.bot.send_photo(chat_id=TEST_GROUP_CHAT_ID, photo=media["file_id"], caption=caption)
-            await msg.reply_text("Posted image + caption to the Penny Testing Group ✅")
-        elif media and media.get("type") == "animation":
-            await context.bot.send_animation(chat_id=TEST_GROUP_CHAT_ID, animation=media["file_id"], caption=caption)
-            await msg.reply_text("Posted GIF + caption to the Penny Testing Group ✅")
+        if media_type == "photo":
+            await context.bot.send_photo(chat_id=TESTING_GROUP_ID, photo=file_id, caption=caption)
+        elif media_type == "animation":
+            await context.bot.send_animation(chat_id=TESTING_GROUP_ID, animation=file_id, caption=caption)
         else:
-            await context.bot.send_message(chat_id=TEST_GROUP_CHAT_ID, text=caption)
-            await msg.reply_text("Posted text to the Penny Testing Group ✅ (send a photo/GIF first if you want media)")
+            await msg.reply_text("Unsupported media type.")
+            return
+
+        await msg.reply_text("Posted to the testing group.")
     except Exception as e:
-        logger.exception("post_test_caption failed: %r", e)
-        await msg.reply_text(f"Failed to post. Error: {e!r}")
+        logger.exception("Failed to post to testing group: %s", repr(e))
+        await msg.reply_text("Failed to post. Check logs.")
 
-# TEMP: Get Telegram GIF file_id (send GIF to Penny in a DM)
-async def debug_get_gif_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg:
-        return
-    if msg.chat.type != ChatType.PRIVATE:
-        return
-    if msg.animation:
-        file_id = msg.animation.file_id
-        await msg.reply_text(f"GIF file_id:\n{file_id}")
-        logger.info("WELCOME_GIF_FILE_ID=%s", file_id)
-    else:
-        await msg.reply_text("No GIF animation detected. Please send the GIF as an animation (GIF).")
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.text:
         return
 
-    if not should_respond(update):
+    chat = msg.chat
+    chat_id = chat.id
+    user = msg.from_user
+    if not user:
+        return
+    user_id = user.id
+
+    text_in = msg.text.strip()
+
+    # Determine whether this is a reply to the bot
+    is_reply_to_bot = False
+    if msg.reply_to_message and msg.reply_to_message.from_user and BOT_USERNAME:
+        is_reply_to_bot = (msg.reply_to_message.from_user.username or "").lower() == BOT_USERNAME.lower()
+
+    # DMs: always respond
+    if chat.type == ChatType.PRIVATE:
+        user_text = text_in
+    else:
+        # Groups: only respond if triggered
+        if not should_respond(text_in, is_reply_to_bot):
+            return
+        user_text = strip_trigger_prefix(text_in)
+
+    # Persist memory
+    add_memory(chat_id, user_id, "user", user_text)
+
+    # Call OpenAI
+    answer, err = openai_reply(chat_id, user_id, user_text)
+    if err:
+        await msg.reply_text("I hit an error calling the model. Check Railway logs and your OPENAI settings.")
         return
 
-    raw_text = msg.text.strip()
-    user_text = strip_trigger_prefix(raw_text)
-
-    if (starts_with_trigger(raw_text) or starts_with_mention(raw_text)) and not user_text:
-        await msg.reply_text("Hey. What do you want to do?")
-        return
-
-    if GREETING_RE.match(user_text if user_text else raw_text):
-        await msg.reply_text("Hey. How can I help?")
-        return
-
-    chat_id = msg.chat.id
-    user_id = msg.from_user.id if msg.from_user else 0
-
-    add_to_memory(chat_id, user_id, "user", user_text if user_text else raw_text)
-
-    assistant_text, err = answer_openai_reply(
-        chat_id,
-        user_id,
-        user_text if user_text else raw_text,
-        client=client,
-        openai_model=OPENAI_MODEL,
-        build_messages=build_messages,
-    )
-
-    if assistant_text:
-        add_to_memory(chat_id, user_id, "assistant", assistant_text)
-        await msg.reply_text(assistant_text)
-        return
-
-    logger.error("Model returned no response. Error: %s", err)
-    await msg.reply_text("I ran into an issue answering that. Try again in a moment.")
+    add_memory(chat_id, user_id, "assistant", answer)
+    await msg.reply_text(answer)
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
 
-    register_welcome_gate_handlers(app)
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("posttestcaption", post_test_caption))
 
-    # stash media in DM for later posting
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.ANIMATION), stash_dm_media))
+    # DM media stash (photos/animations)
+    app.add_handler(MessageHandler(filters.PHOTO | filters.ANIMATION, stash_dm_media))
 
-    # TEMP: Listen for GIFs in DM and reply with file_id (kept for convenience)
-    app.add_handler(MessageHandler(filters.ANIMATION, debug_get_gif_file_id))
+    # Text messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    logger.info("Penny is running (%s). Model=%s", ENV, OPENAI_MODEL)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Starting Penny bot...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
