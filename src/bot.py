@@ -20,6 +20,7 @@ from welcome_gate import register_welcome_gate_handlers
 
 # NEW: Paycheck Labs knowledge base (lightweight retrieval)
 from knowledge_base import build_kb_context
+from answer import openai_reply as answer_openai_reply
 
 logging.basicConfig(
     level=logging.INFO,
@@ -328,7 +329,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = msg.from_user.id if msg.from_user else 0
 
     add_to_memory(chat_id, user_id, "user", user_text if user_text else raw_text)
-    assistant_text, err = openai_reply(chat_id, user_id, user_text if user_text else raw_text)
+    assistant_text, err = answer_openai_reply(
+    chat_id,
+    user_id,
+    user_text if user_text else raw_text,
+    client=client,
+    openai_model=OPENAI_MODEL,
+    build_messages=build_messages,
+)
 
     if assistant_text:
         add_to_memory(chat_id, user_id, "assistant", assistant_text)
