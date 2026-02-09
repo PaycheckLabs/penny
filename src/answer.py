@@ -1,184 +1,159 @@
-# src/answer.py
-from __future__ import annotations
-
+import os
 import re
 from pathlib import Path
-from typing import Iterable, List, Tuple, Optional
+from typing import List, Tuple, Dict
 
-_STOPWORDS = {
-    "the","a","an","and","or","but","if","then","so","to","of","in","on","for","with","at","by","from",
-    "is","are","was","were","be","been","being","it","this","that","these","those","as","not","no","do",
-    "does","did","can","could","should","would","will","just","about","into","over","under","more","most",
-    "your","you","we","our","they","their","them","i","me","my"
-}
+# This module is intentionally lightweight.
+# It exists so bot.py can optionally delegate answering logic here without crashing.
 
-_EXCLUDE_DIRS = {
-    ".git", ".github", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache", "dist", "build"
-}
+CHECKS_DOCS_DIR = os.getenv("CHECKS_DOCS_DIR", "").strip()
 
-def _repo_root() -> Path:
-    # /app/src/answer.py -> /app/src -> /app
-    return Path(__file__).resolve().parents[1]
 
-def _normalize_words(text: str) -> List[str]:
-    # keep hyphenated terms useful by splitting into words
-    text = text.lower().replace("-", " ")
-    words = re.findall(r"[a-z0-9]{2,}", text)
-    return [w for w in words if w not in _STOPWORDS]
+def _candidate_checks_docs_dirs() -> List[Path]:
+    here = Path(__file__).resolve()
+    src_dir = here.parent
+    repo_root = src_dir.parent
 
-def _iter_md_files(dir_path: Path) -> List[Path]:
-    if not dir_path.exists() or not dir_path.is_dir():
-        return []
-    out: List[Path] = []
-    for p in dir_path.rglob("*.md"):
-        if not p.is_file():
-            continue
-        if any(part in _EXCLUDE_DIRS for part in p.parts):
-            continue
-        out.append(p)
-    return sorted(out)
+    candidates: List[Path] = []
+    if CHECKS_DOCS_DIR:
+        candidates.append(Path(CHECKS_DOCS_DIR))
 
-def _iter_md_files_repo_wide(repo: Path) -> List[Path]:
-    out: List[Path] = []
-    for p in repo.rglob("*.md"):
-        if not p.is_file():
-            continue
-        if any(part in _EXCLUDE_DIRS for part in p.parts):
-            continue
-        out.append(p)
-    return sorted(out)
+    candidates.append(src_dir / "data" / "checks_whitepaper")
+    candidates.append(repo_root / "src" / "data" / "checks_whitepaper")
+    candidates.append(repo_root / "docs" / "checks_whitepaper")
+    candidates.append(repo_root / "data" / "checks_whitepaper")
+    candidates.append(repo_root / "checks_whitepaper")
 
-def _chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[str]:
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    if not text:
-        return []
-    chunks: List[str] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        chunks.append(text[i : i + chunk_size])
-        i += max(1, chunk_size - overlap)
-    return chunks
-
-def _score_chunk(q_words: List[str], chunk: str) -> int:
-    if not q_words:
-        return 0
-
-    c_low = chunk.lower()
-    c_words = set(_normalize_words(chunk))
-
-    score = 0
-    # Base word hits
-    for w in q_words:
-        if w in c_words:
-            score += 2
-
-    # Strong boost for exact phrase-ish matches of key terms
-    # specifically help for "auto investment" / "auto-investment"
-    if "auto" in q_words and "investment" in q_words:
-        if "auto investment" in c_low or "auto-investment" in c_low:
-            score += 10
-        # still boost if both words appear anywhere
-        if "auto" in c_words and "investment" in c_words:
-            score += 5
-
-    # Small boost if the query contains a rare-looking token and it appears
-    # (example: "autoinvestment")
-    for w in q_words:
-        if len(w) >= 10 and w in c_low:
-            score += 3
-
-    return score
-
-def build_checks_context(
-    user_text: str,
-    dirs: Optional[Iterable[str]] = None,
-    max_chars: int = 8000,
-    max_files: int = 80,
-    max_chunks: int = 8,
-) -> str:
-    """
-    Returns a developer-message string containing the most relevant excerpts
-    from synced Checks docs/whitepaper markdown.
-
-    If no matches are found in the provided dirs, falls back to scanning all .md
-    in the repo (excluding .github/.git/etc.) so we don't miss where the sync landed.
-    """
-    repo = _repo_root()
-
-    # Default to the common places you’ve used so far + what your screenshots show.
-    if dirs is None:
-        dirs = [
-            "docs",
-            "src/data/checks_whitepaper",
-            "src/data/checks_whitepaper/docs",
-        ]
-
-    q_words = _normalize_words(user_text)
-    if not q_words:
-        return ""
-
-    # Build directory list
-    search_dirs: List[Path] = []
-    for d in dirs:
-        d = (d or "").strip()
-        if not d:
-            continue
-        search_dirs.append((repo / d).resolve())
-
-    # Collect markdown files from those dirs
-    md_files: List[Path] = []
-    for d in search_dirs:
-        md_files.extend(_iter_md_files(d))
-
-    # If nothing found in those dirs, fallback to repo-wide scan
-    if not md_files:
-        md_files = _iter_md_files_repo_wide(repo)
-
-    # De-dupe while preserving order
     seen = set()
-    files: List[Path] = []
-    for f in md_files:
-        if f not in seen:
-            seen.add(f)
-            files.append(f)
-
-    if not files:
-        return ""
-
-    scored: List[Tuple[int, str, str]] = []  # (score, relpath, chunk)
-    for f in files[:max_files]:
+    out: List[Path] = []
+    for p in candidates:
         try:
-            raw = f.read_text(encoding="utf-8", errors="ignore").strip()
+            rp = p.expanduser().resolve()
+        except Exception:
+            rp = p
+        if str(rp) not in seen:
+            seen.add(str(rp))
+            out.append(rp)
+    return out
+
+
+def _read_markdown_files(root: Path, max_files: int = 200) -> List[Tuple[str, str]]:
+    items: List[Tuple[str, str]] = []
+    if not root.exists() or not root.is_dir():
+        return items
+
+    count = 0
+    for path in sorted(root.rglob("*")):
+        if count >= max_files:
+            break
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in {".md", ".markdown", ".mdx", ".txt"}:
+            continue
+        try:
+            txt = path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        if not raw:
+        items.append((str(path.relative_to(root)), txt))
+        count += 1
+    return items
+
+
+def _score_doc_text(query_terms: List[str], text: str) -> int:
+    if not query_terms or not text:
+        return 0
+    t = text.lower()
+    score = 0
+    for term in query_terms:
+        hits = t.count(term)
+        if hits:
+            score += min(hits, 6)
+    return score
+
+
+def get_checks_docs_context(user_text: str, char_budget: int = 6000) -> Tuple[str, str]:
+    user_text_l = (user_text or "").lower()
+    triggers = [
+        "checks", "check token", "$check", "nft check", "checks platform",
+        "whitepaper", "roadmap", "post-mvp", "auto-invest", "autoinvest", "auto investment"
+    ]
+    if not any(t in user_text_l for t in triggers):
+        return ("", "")
+
+    raw_terms = re.findall(r"[a-z0-9\-]{3,}", user_text_l)
+    raw_terms += ["post-mvp", "postmvp", "auto-invest", "autoinvest", "investment", "roadmap"]
+    query_terms = sorted(set(raw_terms))
+
+    for root in _candidate_checks_docs_dirs():
+        files = _read_markdown_files(root)
+        if not files:
             continue
 
-        rel = str(f.relative_to(repo)) if f.is_relative_to(repo) else str(f)
-        for ch in _chunk_text(raw):
-            s = _score_chunk(q_words, ch)
+        ranked: List[Tuple[int, str, str]] = []
+        for rel, txt in files:
+            s = _score_doc_text(query_terms, txt)
             if s > 0:
-                scored.append((s, rel, ch.strip()))
+                ranked.append((s, rel, txt))
 
-    if not scored:
-        return ""
+        ranked.sort(key=lambda x: x[0], reverse=True)
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    picked = scored[:max_chunks]
+        parts: List[str] = []
+        used = 0
+        if ranked:
+            for s, rel, txt in ranked[:8]:
+                snippet = txt.strip()
+                if len(snippet) > 1800:
+                    snippet = snippet[:1800] + "\n…"
+                block = f"FILE: {rel}\n{snippet}"
+                if used + len(block) + 2 > char_budget:
+                    break
+                parts.append(block)
+                used += len(block) + 2
+        else:
+            manifest = "\n".join([f"- {rel}" for rel, _ in files[:40]])
+            parts.append("No strong keyword match. Available files (partial):\n" + manifest)
 
-    out: List[str] = []
-    out.append(
-        "CHECKS WHITEPAPER / DOCS EXCERPTS (use these as source of truth when relevant):\n"
-        "- If the answer is not supported by these excerpts, say you can't find it in the synced docs.\n"
-        "- Prefer quoting or paraphrasing these excerpts.\n"
+        return (str(root), "\n\n".join(parts).strip())
+
+    return ("", "")
+
+
+def build_messages(system_prompt: str, conversation: List[Tuple[str, str]], user_text: str) -> List[Dict[str, str]]:
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+
+    root, ctx = get_checks_docs_context(user_text)
+    if ctx:
+        messages.append({
+            "role": "system",
+            "content": (
+                "Checks Docs Context (synced markdown excerpts; treat as authoritative within this bot)\n"
+                f"Docs root: {root}\n\n{ctx}"
+            ),
+        })
+
+    for role, content in conversation[-12:]:
+        messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+
+def openai_reply(
+    client,
+    system_prompt: str,
+    conversation: List[Tuple[str, str]],
+    user_text: str,
+    model: str = "gpt-5-nano",
+    max_output_tokens: int = 280,
+) -> str:
+    """
+    Minimal OpenAI response helper for bot.py to import.
+    Expects `client` to be an OpenAI() client instance.
+    """
+    messages = build_messages(system_prompt, conversation, user_text)
+    resp = client.responses.create(
+        model=model,
+        input=messages,
+        max_output_tokens=max_output_tokens,
     )
-
-    for i, (s, rel, ch) in enumerate(picked, start=1):
-        out.append(f"\n[Excerpt {i} | {rel} | score={s}]\n{ch}\n")
-
-    combined = "\n".join(out).strip()
-    if len(combined) > max_chars:
-        combined = combined[:max_chars].rstrip() + "\n\n[truncated]\n"
-
-    return combined
+    return (resp.output_text or "").strip()
