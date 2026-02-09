@@ -1,421 +1,384 @@
-# NOTE: This file is intentionally "single-file" friendly for Railway deployments.
-# Only minimal additions were made to inject synced Checks docs into the prompt.
-
 import os
-import re
 import time
 import json
 import logging
-import signal
-from collections import deque
-from typing import Deque, Dict, List, Tuple, Optional
+import traceback
+from collections import defaultdict, deque
+from typing import Deque, Dict, List, Optional, Tuple
 from pathlib import Path
 
 from telegram import Update
-from telegram.constants import ChatAction, ParseMode
+from telegram.constants import ChatType
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
 from openai import OpenAI
 
-# -------------------------
+from welcome_gate import is_allowed_user
+from knowledge_base import should_attach_kb_context, build_kb_context
+
+# -----------------------------------------------------------------------------
 # Logging
-# -------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("penny")
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("penny-bot")
 
-# -------------------------
-# Env
-# -------------------------
+# -----------------------------------------------------------------------------
+# Environment / Config
+# -----------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", os.getenv("api_key", os.getenv("OPENAI", ""))).strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "450").strip())
 
-MODEL = os.getenv("MODEL", "gpt-5-nano").strip()
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "280"))
-
-# Optional: allow only one admin/user, or allow all
-ALLOWED_TELEGRAM_USER_ID = os.getenv("ALLOWED_TELEGRAM_USER_ID", "").strip()
-
-# Optional: Slash command trigger that "wakes" Penny in group chats
-BOT_TRIGGER = os.getenv("BOT_TRIGGER", "/penny").strip()
-
-# Optional
-BOT_NAME = os.getenv("BOT_NAME", "Penny").strip()
-
-# -------------------------
-# Checks Whitepaper Docs (synced by GitHub Actions)
-# -------------------------
-# Expected landing path (per workflow): /app/src/data/checks_whitepaper on Railway
+# Optional: where the synced Checks docs/whitepaper markdown lives on disk
 CHECKS_DOCS_DIR = os.getenv("CHECKS_DOCS_DIR", "").strip()
+# Upper bound on how much doc text to inject per reply (keeps prompts small)
+CHECKS_DOCS_MAX_CHARS = int(os.getenv("CHECKS_DOCS_MAX_CHARS", "8000").strip())
+
+BOT_USERNAME = os.getenv("BOT_USERNAME", "@HeyPennyBot").strip()
+
+# Limits
+MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "12").strip())
+
+# -----------------------------------------------------------------------------
+# Validate required env
+# -----------------------------------------------------------------------------
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var.")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY env var.")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# -----------------------------------------------------------------------------
+# In-memory conversation store (per chat)
+# -----------------------------------------------------------------------------
+chat_history: Dict[int, Deque[Tuple[str, str]]] = defaultdict(lambda: deque(maxlen=MAX_HISTORY_TURNS))
+
+# -----------------------------------------------------------------------------
+# System prompt
+# -----------------------------------------------------------------------------
+SYSTEM_PROMPT = """You are Penny, the official AI advisor for Paycheck Labs.
+Your job is to provide product guidance, community operations help, and educational responses.
+
+Tone:
+- Calm, precise, helpful.
+- Clarity over hype.
+- If you are unsure, ask a short follow-up question.
+- If a user requests financial advice, do not give it. Offer general education and risk reminders.
+
+Rules:
+- Do not invent features or claim details are in docs unless you have them.
+- If you can’t find something in the synced docs context, say so plainly.
+"""
+
+# -----------------------------------------------------------------------------
+# Docs retrieval (best-effort local scan)
+# -----------------------------------------------------------------------------
+def _repo_root() -> Path:
+    # bot.py is in src/; repo root is one level up
+    return Path(__file__).resolve().parent.parent
 
 
-def _candidate_checks_docs_dirs() -> List[Path]:
-    """
-    Return plausible locations for the synced Checks docs, in order of preference.
-    This is intentionally defensive because different deploy targets may have different working dirs.
-    """
-    here = Path(__file__).resolve()
-    src_dir = here.parent  # .../src
-    repo_root = src_dir.parent
-
-    candidates: List[Path] = []
-
-    # 1) Explicit env var, if provided
+def _candidate_docs_dirs() -> list[Path]:
+    # 1) explicit env var
+    dirs: list[Path] = []
     if CHECKS_DOCS_DIR:
-        candidates.append(Path(CHECKS_DOCS_DIR))
+        dirs.append(Path(CHECKS_DOCS_DIR))
 
-    # 2) Expected path in this repo layout
-    candidates.append(src_dir / "data" / "checks_whitepaper")
-    candidates.append(repo_root / "src" / "data" / "checks_whitepaper")
+    root = _repo_root()
+    # 2) common sync destinations (support both)
+    dirs.extend(
+        [
+            root / "src" / "data" / "checks_whitepaper",
+            root / "docs",
+            root / "src" / "docs",
+        ]
+    )
 
-    # 3) Common alternates if someone changed the sync script
-    candidates.append(repo_root / "docs" / "checks_whitepaper")
-    candidates.append(repo_root / "data" / "checks_whitepaper")
-    candidates.append(repo_root / "checks_whitepaper")
-
-    # Normalize / de-dupe while preserving order
+    # de-dupe, keep existing only
+    out: list[Path] = []
     seen = set()
-    out: List[Path] = []
-    for p in candidates:
+    for d in dirs:
         try:
-            rp = p.expanduser().resolve()
+            d = d.resolve()
         except Exception:
-            rp = p
-        if str(rp) not in seen:
-            seen.add(str(rp))
-            out.append(rp)
+            pass
+        if str(d) in seen:
+            continue
+        seen.add(str(d))
+        if d.exists() and d.is_dir():
+            out.append(d)
     return out
 
 
-def _read_markdown_files(root: Path, max_files: int = 200) -> List[Tuple[str, str]]:
-    """
-    Read markdown-ish files under root.
-    Returns list of (relative_path, text).
-    """
-    items: List[Tuple[str, str]] = []
-    if not root.exists() or not root.is_dir():
-        return items
+def _read_markdown_files(base: Path) -> list[tuple[str, str]]:
+    """Return list of (path, text) for .md files under base."""
+    files: list[Path] = []
+    files.extend(sorted(base.glob("*.md")))
+    files.extend(sorted(base.rglob("*.md")))
 
-    count = 0
-    for path in sorted(root.rglob("*")):
-        if count >= max_files:
-            break
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in {".md", ".markdown", ".mdx", ".txt"}:
+    seen = set()
+    out: list[tuple[str, str]] = []
+    for fp in files:
+        if not fp.is_file():
             continue
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            key = str(fp.resolve())
+        except Exception:
+            key = str(fp)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        try:
+            txt = fp.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             continue
-        rel = str(path.relative_to(root))
-        items.append((rel, text))
-        count += 1
-    return items
-
-
-def _score_doc_text(query_terms: List[str], text: str) -> int:
-    """
-    Tiny keyword overlap scorer. Fast and dependency-free.
-    """
-    if not query_terms or not text:
-        return 0
-    t = text.lower()
-    score = 0
-    for term in query_terms:
-        if not term:
-            continue
-        # Favor exact term hits; count a few occurrences but cap to avoid long-doc dominance.
-        hits = t.count(term)
-        if hits:
-            score += min(hits, 6)
-    return score
-
-
-def get_checks_docs_context(user_text: str, char_budget: int = 6000) -> Tuple[str, str]:
-    """
-    Returns (chosen_root, context_text). If not found, returns ("", "").
-    Context is assembled from the most relevant markdown files.
-    """
-    user_text_l = (user_text or "").lower()
-
-    # If the user isn't asking about Checks, bail early.
-    checks_triggers = [
-        "checks",
-        "check token",
-        "$check",
-        "nft check",
-        "checks platform",
-        "whitepaper",
-        "roadmap",
-        "post-mvp",
-        "auto-invest",
-        "autoinvest",
-        "auto investment",
-    ]
-    if not any(t in user_text_l for t in checks_triggers):
-        return ("", "")
-
-    # Basic term list for scoring
-    # Keep short terms out to reduce noise
-    raw_terms = re.findall(r"[a-z0-9\-]{3,}", user_text_l)
-    # Add a couple normalized variants
-    raw_terms += ["post-mvp", "postmvp", "auto-invest", "autoinvest", "auto", "investment", "roadmap"]
-    query_terms = sorted(set(raw_terms))
-
-    for root in _candidate_checks_docs_dirs():
-        files = _read_markdown_files(root)
-        if not files:
+        if not txt.strip():
             continue
 
-        ranked: List[Tuple[int, str, str]] = []
-        for rel, txt in files:
-            s = _score_doc_text(query_terms, txt)
-            if s > 0:
-                ranked.append((s, rel, txt))
-
-        # If nothing scored, still provide a tiny index hint (so the model knows docs exist)
-        ranked.sort(key=lambda x: x[0], reverse=True)
-
-        parts: List[str] = []
-        used = 0
-
-        if ranked:
-            for s, rel, txt in ranked[:8]:
-                snippet = txt.strip()
-                # Light trimming
-                if len(snippet) > 1800:
-                    snippet = snippet[:1800] + "\n…"
-                block = f"FILE: {rel}\n{snippet}"
-                if used + len(block) + 2 > char_budget:
-                    break
-                parts.append(block)
-                used += len(block) + 2
-        else:
-            # No keyword matches; include a short manifest of available files
-            manifest = "\n".join([f"- {rel}" for rel, _ in files[:40]])
-            parts.append("No strong keyword match. Available files (partial):\n" + manifest)
-
-        context = "\n\n".join(parts).strip()
-        return (str(root), context)
-
-    return ("", "")
+        # try to show a stable relative path for citations
+        try:
+            rel = str(fp.resolve().relative_to(_repo_root()))
+        except Exception:
+            rel = str(fp)
+        out.append((rel, txt))
+    return out
 
 
-# -------------------------
-# OpenAI
-# -------------------------
-if not OPENAI_API_KEY:
-    log.warning("OPENAI_API_KEY not set. Penny will not be able to answer.")
+def _tokenize(s: str) -> set[str]:
+    import re as _re
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-# -------------------------
-# Conversation state
-# -------------------------
-# Keep a short rolling buffer per chat.
-CHAT_HISTORY: Dict[int, Deque[Tuple[str, str]]] = {}
-MAX_TURNS = 12
-
-# -------------------------
-# Base system prompt
-# -------------------------
-SYSTEM_PROMPT = """You are Penny, the official AI advisor for Paycheck Labs.
-
-You are:
-- Calm, precise, and helpful.
-- Protective: you do not hallucinate. If you don't know, say so.
-- Practical: you provide actionable steps, not vague statements.
-
-Behavior rules:
-- If asked about Paycheck Labs, Checks Platform, or Check Token, answer directly and accurately.
-- If not asked, do not volunteer company internal details.
-- If you have authoritative docs context provided in the conversation, treat it as the source of truth.
-- Keep answers concise unless the user asks for more detail.
-"""
-
-# Optional: extra system context (kept empty by default)
-SYSTEM_CONTEXT = os.getenv("SYSTEM_CONTEXT", "").strip()
+    toks = _re.findall(r"[a-zA-Z0-9_\$]{2,}", s.lower())
+    stop = {
+        "the",
+        "and",
+        "for",
+        "with",
+        "that",
+        "this",
+        "from",
+        "into",
+        "your",
+        "you",
+        "are",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "how",
+        "why",
+        "can",
+        "could",
+        "should",
+        "would",
+        "about",
+        "onto",
+    }
+    return {t for t in toks if t not in stop}
 
 
-def get_chat_history(chat_id: int) -> Deque[Tuple[str, str]]:
-    if chat_id not in CHAT_HISTORY:
-        CHAT_HISTORY[chat_id] = deque(maxlen=MAX_TURNS * 2)  # each turn is user+assistant
-    return CHAT_HISTORY[chat_id]
+def checks_docs_context(query: str) -> str:
+    """Best-effort retrieval from synced markdown docs. Returns a short context string."""
+    qset = _tokenize(query)
+    if not qset:
+        return ""
+
+    chunks: list[tuple[float, str]] = []  # (score, text)
+
+    for d in _candidate_docs_dirs():
+        for rel, txt in _read_markdown_files(d):
+            parts = [p.strip() for p in txt.split("\n\n") if p.strip()]
+            for p in parts:
+                pset = _tokenize(p)
+                if not pset:
+                    continue
+                overlap = len(qset & pset)
+                if overlap == 0:
+                    continue
+                boost = 1.5 if any(t in rel.lower() for t in qset) else 0.0
+                score = overlap + boost
+                snippet = f"[{rel}]\n{p}"
+                chunks.append((score, snippet))
+
+    if not chunks:
+        return ""
+
+    chunks.sort(key=lambda x: x[0], reverse=True)
+
+    out: list[str] = []
+    total = 0
+    for score, snippet in chunks[:40]:
+        if total >= CHECKS_DOCS_MAX_CHARS:
+            break
+        add = snippet + "\n---\n"
+        if total + len(add) > CHECKS_DOCS_MAX_CHARS and out:
+            break
+        out.append(add)
+        total += len(add)
+
+    return "".join(out).strip()
 
 
-def user_is_allowed(update: Update) -> bool:
-    if not ALLOWED_TELEGRAM_USER_ID:
-        return True
+# -----------------------------------------------------------------------------
+# Message building + OpenAI call
+# -----------------------------------------------------------------------------
+def build_messages(chat_id: int, user_text: str) -> List[Dict[str, str]]:
+    msgs: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    # Best-effort: inject relevant snippets from synced Checks docs/whitepaper
     try:
-        return str(update.effective_user.id) == str(ALLOWED_TELEGRAM_USER_ID)
+        ctx = checks_docs_context(user_text)
     except Exception:
-        return False
+        ctx = ""
+
+    if ctx:
+        msgs.insert(
+            0,
+            {
+                "role": "system",
+                "content": (
+                    "Use ONLY the following synced Checks docs excerpts as an authoritative source when answering questions about Checks.\n"
+                    "If the excerpts do not contain the answer, say you could not find it in the synced docs and ask a follow-up question.\n\n"
+                    f"{ctx}"
+                ),
+            },
+        )
+
+    # Attach KB context only when useful (your existing logic)
+    try:
+        if should_attach_kb_context(user_text):
+            kb_context = build_kb_context(user_text)
+            if kb_context:
+                msgs.append(
+                    {
+                        "role": "system",
+                        "content": f"Paycheck Labs internal context (use only if relevant):\n{kb_context}",
+                    }
+                )
+    except Exception:
+        pass
+
+    # Add history
+    for role, content in chat_history[chat_id]:
+        msgs.append({"role": role, "content": content})
+
+    # Add current user message
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
 
 
-def should_respond_in_chat(text: str) -> bool:
-    """
-    In group chats, only respond when the message starts with /penny (or whatever BOT_TRIGGER is).
-    In DMs, respond to everything.
-    """
-    if not text:
-        return False
-    t = text.strip()
-    return t.lower().startswith(BOT_TRIGGER.lower())
-
-
-def strip_trigger(text: str) -> str:
-    t = (text or "").strip()
-    if t.lower().startswith(BOT_TRIGGER.lower()):
-        return t[len(BOT_TRIGGER):].strip()
-    return t
-
-
-def build_messages(system_prompt: str, conversation: List[Tuple[str, str]], user_text: str) -> List[Dict[str, str]]:
-    messages: List[Dict[str, str]] = []
-    messages.append({
-        "role": "system",
-        "content": system_prompt,
-    })
-
-    system_context = SYSTEM_CONTEXT
-    if system_context:
-        messages.append({
-            "role": "system",
-            "content": system_context,
-        })
-
-    # If relevant, inject synced Checks whitepaper/docs context (read-only excerpts)
-    checks_root, checks_ctx = get_checks_docs_context(user_text)
-    if checks_ctx:
-        messages.append({
-            "role": "system",
-            "content": (
-                "Checks Docs Context (synced markdown excerpts; treat as authoritative within this bot)\n"
-                f"Docs root: {checks_root}\n\n"
-                f"{checks_ctx}"
-            ),
-        })
-
-    # Add prior conversation (trimmed)
-    for role, content in conversation[-(MAX_TURNS * 2):]:
-        messages.append({
-            "role": role,
-            "content": content,
-        })
-
-    # Current user message
-    messages.append({
-        "role": "user",
-        "content": user_text,
-    })
-
-    return messages
-
-
-def openai_reply(conversation: List[Tuple[str, str]], user_text: str) -> str:
-    if not client:
-        return "OpenAI is not configured (missing OPENAI_API_KEY)."
-
-    messages = build_messages(SYSTEM_PROMPT, conversation, user_text)
+def openai_reply(chat_id: int, user_text: str) -> str:
+    messages = build_messages(chat_id, user_text)
 
     try:
         resp = client.responses.create(
-            model=MODEL,
+            model=OPENAI_MODEL,
             input=messages,
-            max_output_tokens=MAX_OUTPUT_TOKENS,
+            max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
         )
-        return (resp.output_text or "").strip()
+        out = (resp.output_text or "").strip()
+        return out if out else "I didn’t get a response back. Try again."
     except Exception as e:
-        log.exception("OpenAI call failed")
-        return f"I hit an error calling the model. Check Railway logs and your OPENAI settings.\n\nError: {type(e).__name__}"
+        logger.error("OpenAI error: %s", e)
+        logger.error(traceback.format_exc())
+        return "I hit an error calling the model. Check Railway logs and your OPENAI settings."
 
 
-# -------------------------
-# Telegram handlers
-# -------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not user_is_allowed(update):
+# -----------------------------------------------------------------------------
+# Handlers
+# -----------------------------------------------------------------------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
         return
-    await update.message.reply_text(
-        f"Hi — I’m {BOT_NAME}. Ask me anything, or use `{BOT_TRIGGER} <question>` in group chats.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await update.message.reply_text("Hi — I’m Penny. Ask me anything about Paycheck Labs or Checks.")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not user_is_allowed(update):
+    if not update.message:
         return
     await update.message.reply_text(
         "Commands:\n"
-        "/start — intro\n"
-        "/help — this help\n\n"
-        "In group chats, use:\n"
-        f"{BOT_TRIGGER} <your question>",
+        "/start — start\n"
+        "/help — help\n\n"
+        "You can also just message me normally."
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _should_respond_in_group(update: Update) -> bool:
+    """Respond in groups only when directly mentioned or replied-to, to avoid spam."""
+    if not update.message:
+        return False
+
+    text = update.message.text or ""
+    # If user replied to bot
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        if update.message.reply_to_message.from_user.username:
+            if update.message.reply_to_message.from_user.username.lower() in (BOT_USERNAME or "").lower():
+                return True
+        # Some bots may not have username populated; allow reply anyway
+        return True
+
+    # If bot username mentioned
+    if BOT_USERNAME and BOT_USERNAME.lower() in text.lower():
+        return True
+
+    return False
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    if not user_is_allowed(update):
+
+    # Gatekeeping (your existing allowlist logic)
+    if not is_allowed_user(update):
         return
 
-    text = (update.message.text or "").strip()
-    if not text:
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    chat_type = update.effective_chat.type if update.effective_chat else None
+
+    user_text = (update.message.text or "").strip()
+    if not user_text:
         return
 
-    # If group chat, require trigger; if DM, respond normally.
-    is_group = update.effective_chat and update.effective_chat.type in ("group", "supergroup")
-
-    if is_group:
-        if not should_respond_in_chat(text):
+    # Group handling: only respond when mentioned/replied to
+    if chat_type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        if not _should_respond_in_group(update):
             return
-        user_text = strip_trigger(text)
-        if not user_text:
-            return
-    else:
-        user_text = text
 
-    chat_id = update.effective_chat.id
-    history = get_chat_history(chat_id)
+    # Store user message in history
+    chat_history[chat_id].append(("user", user_text))
 
-    # Add user message to history
-    history.append(("user", user_text))
+    # Get reply
+    reply = openai_reply(chat_id, user_text)
 
-    await update.message.chat.send_action(action=ChatAction.TYPING)
-
-    reply = openai_reply(list(history), user_text)
-
-    # Add assistant reply to history
-    history.append(("assistant", reply))
+    # Store assistant reply in history
+    chat_history[chat_id].append(("assistant", reply))
 
     await update.message.reply_text(reply)
 
 
-def _build_app() -> Application:
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
-
+def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    return app
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-
-def main() -> None:
-    app = _build_app()
-    log.info("Starting Penny Telegram bot...")
-    app.run_polling(close_loop=False)
+    logger.info("Penny bot starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
