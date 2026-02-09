@@ -1,74 +1,156 @@
-# src/answer.py
+"""
+answer.py
+
+Lightweight retrieval from locally-synced Checks docs.
+
+This file does NOT call external services.
+It reads markdown/text files under: docs/checks_whitepaper/
+and returns a short "developer" context block to inject into the model.
+"""
+
 from __future__ import annotations
 
-import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import re
+from functools import lru_cache
+from pathlib import Path
+from typing import List, Tuple
 
 
-def _extract_output_text(resp: Any) -> str:
-    """Best-effort extraction across OpenAI SDK response shapes."""
-    # New Responses API shape
-    if hasattr(resp, "output_text") and isinstance(getattr(resp, "output_text"), str):
-        return resp.output_text.strip()
+DOCS_ROOT = Path(__file__).resolve().parent.parent  # repo root (src/..)
+CHECKS_DOCS_DIR = DOCS_ROOT / "docs" / "checks_whitepaper"
 
-    # Chat Completions shape
-    try:
-        return resp.choices[0].message.content.strip()
-    except Exception:
-        pass
-
-    # Fallback: try output[0].content[0].text
-    try:
-        out0 = resp.output[0]
-        c0 = out0.content[0]
-        if hasattr(c0, "text"):
-            return str(c0.text).strip()
-    except Exception:
-        pass
-
-    return ""
+_ALLOWED_EXTS = {".md", ".txt"}
 
 
-def openai_reply(
-    chat_id: int,
-    user_id: int,
-    user_text: str,
-    *,
-    client: Any,
-    openai_model: str,
-    build_messages: Callable[[int, int, str], List[Dict[str, str]]],
-    max_retries: int = 2,
-) -> Tuple[str, Optional[str]]:
-    """Call OpenAI and return (assistant_text, error_string_or_None)."""
+def _keywords(query: str) -> List[str]:
+    q = query.lower()
+    stop = {
+        "what", "when", "where", "which", "who", "whom", "this", "that", "these", "those",
+        "with", "from", "into", "your", "about", "tell", "more", "some", "does", "doing",
+        "have", "will", "would", "should", "could", "just", "like", "than", "then",
+        "please", "penny", "checks", "check", "token", "platform", "whitepaper",
+    }
+    words = re.findall(r"[a-z0-9][a-z0-9\-]{2,}", q)
+    kws = [w for w in words if len(w) >= 4 and w not in stop]
 
-    if not user_text:
-        return "", None
+    seen = set()
+    out: List[str] = []
+    for w in kws:
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out[:12]
 
-    messages = build_messages(chat_id, user_id, user_text)
 
-    last_err: Optional[str] = None
-    for attempt in range(max_retries + 1):
-        try:
-            # Prefer the Responses API when available
-            if hasattr(client, "responses") and hasattr(client.responses, "create"):
-                resp = client.responses.create(
-                    model=openai_model,
-                    input=messages,
-                )
-                return _extract_output_text(resp), None
+def _is_checks_related(query: str) -> bool:
+    q = query.lower()
+    triggers = [
+        "checks", "check token", "$check", "nft check", "whitepaper", "gitbook",
+        "post-mvp", "mvp", "roadmap", "auto-invest", "auto investment", "autoinvest",
+        "vesting", "escrow", "redeem", "mint",
+    ]
+    return any(t in q for t in triggers)
 
-            # Fallback: Chat Completions
-            resp = client.chat.completions.create(
-                model=openai_model,
-                messages=messages,
-            )
-            return _extract_output_text(resp), None
 
-        except Exception as e:
-            last_err = str(e)
-            if attempt < max_retries:
-                time.sleep(1.0 * (attempt + 1))
+@lru_cache(maxsize=1)
+def _load_docs() -> List[Tuple[str, str]]:
+    docs: List[Tuple[str, str]] = []
+    if not CHECKS_DOCS_DIR.exists():
+        return docs
+
+    for p in CHECKS_DOCS_DIR.rglob("*"):
+        if p.is_file() and p.suffix.lower() in _ALLOWED_EXTS:
+            try:
+                docs.append((str(p.relative_to(DOCS_ROOT)), p.read_text(encoding="utf-8", errors="replace")))
+            except Exception:
                 continue
-            return "", last_err
+    return docs
 
-    return "", last_err
+
+def _chunk_text(text: str, max_chunk_chars: int = 1800) -> List[str]:
+    parts = re.split(r"\n(?=(?:#{1,6}\s)|(?:\n{2,}))", text)
+    cleaned = [p.strip() for p in parts if p and p.strip()]
+
+    chunks: List[str] = []
+    buf = ""
+    for part in cleaned:
+        if not buf:
+            buf = part
+            continue
+        if len(buf) + 2 + len(part) <= max_chunk_chars:
+            buf = buf + "\n\n" + part
+        else:
+            chunks.append(buf)
+            buf = part
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+def _score_chunk(chunk: str, kws: List[str]) -> int:
+    c = chunk.lower()
+    score = 0
+    for w in kws:
+        score += min(c.count(w), 10)
+
+    if "post-mvp" in c:
+        score += 6
+    if "roadmap" in c:
+        score += 3
+    if "auto-invest" in c or "auto investment" in c or "autoinvest" in c:
+        score += 10
+
+    return score
+
+
+def get_checks_context(user_text: str, max_chars: int = 6000) -> str:
+    if not _is_checks_related(user_text):
+        return ""
+
+    docs = _load_docs()
+    if not docs:
+        return ""
+
+    kws = _keywords(user_text) or ["post-mvp", "roadmap", "feature", "mvp"]
+
+    scored: List[Tuple[int, str, str]] = []  # (score, path, chunk)
+    for rel_path, text in docs:
+        for chunk in _chunk_text(text):
+            s = _score_chunk(chunk, kws)
+            if s > 0:
+                scored.append((s, rel_path, chunk))
+
+    if not scored:
+        return ""
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    picked: List[Tuple[str, str]] = []
+    used_files = set()
+    for score, rel_path, chunk in scored:
+        if rel_path not in used_files or len(used_files) < 2:
+            picked.append((rel_path, chunk))
+            used_files.add(rel_path)
+        if len(picked) >= 4:
+            break
+
+    out_lines: List[str] = []
+    out_lines.append(
+        "CHECKS_DOCS_CONTEXT (local, synced from checks-gitbook). "
+        "Use this as the primary source for Checks/whitepaper questions. "
+        "If the answer is not in these excerpts, say so and ask a follow-up."
+    )
+    out_lines.append("")
+
+    for rel_path, chunk in picked:
+        snippet = chunk.strip()
+        out_lines.append(f"[Source: {rel_path}]")
+        out_lines.append(snippet)
+        out_lines.append("")
+
+    ctx = "\n".join(out_lines).strip()
+
+    if len(ctx) > max_chars:
+        ctx = ctx[:max_chars].rstrip() + "\n\n[...truncated...]"
+
+    return ctx
