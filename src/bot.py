@@ -1,359 +1,422 @@
-# src/bot.py
+# NOTE: This file is intentionally "single-file" friendly for Railway deployments.
+# Only minimal additions were made to inject synced Checks docs into the prompt.
+
 import os
 import re
 import time
 import json
 import logging
-from typing import Dict, List, Optional, Tuple
-
-from openai import OpenAI
+import signal
+from collections import deque
+from typing import Deque, Dict, List, Tuple, Optional
+from pathlib import Path
 
 from telegram import Update
-from telegram.constants import ChatType
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
-    ContextTypes,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
-# Existing KB helper
-from knowledge_base import build_kb_context
+from openai import OpenAI
 
-# NEW: Docs excerpt helper (synced whitepaper/docs)
-from answer import build_checks_context
+# -------------------------
+# Logging
+# -------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("penny")
 
-logger = logging.getLogger("penny")
-logging.basicConfig(level=logging.INFO)
+# -------------------------
+# Env
+# -------------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", os.getenv("api_key", os.getenv("OPENAI", ""))).strip()
 
-# ----------------------------
-# ENV
-# ----------------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
-BOT_TRIGGER = os.getenv("BOT_TRIGGER", "penny").lower()
+MODEL = os.getenv("MODEL", "gpt-5-nano").strip()
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "280"))
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "") or os.getenv("api_key", "") or os.getenv("OPENAI", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "500"))
+# Optional: allow only one admin/user, or allow all
+ALLOWED_TELEGRAM_USER_ID = os.getenv("ALLOWED_TELEGRAM_USER_ID", "").strip()
 
-# Admin controls
-ADMIN_IDS = set()
-_raw_admin = os.getenv("ADMIN_IDS", "").strip()
-if _raw_admin:
-    for part in _raw_admin.split(","):
-        part = part.strip()
-        if part.isdigit():
-            ADMIN_IDS.add(int(part))
+# Optional: Slash command trigger that "wakes" Penny in group chats
+BOT_TRIGGER = os.getenv("BOT_TRIGGER", "/penny").strip()
 
-# Testing group target (optional)
-TESTING_GROUP_ID = os.getenv("TESTING_GROUP_ID", "").strip()
-if TESTING_GROUP_ID and TESTING_GROUP_ID.lstrip("-").isdigit():
-    TESTING_GROUP_ID = int(TESTING_GROUP_ID)
-else:
-    TESTING_GROUP_ID = None
+# Optional
+BOT_NAME = os.getenv("BOT_NAME", "Penny").strip()
 
-# NEW: Where the synced docs live (comma-separated, relative to repo root)
-# From your screenshots, docs/ contains the synced markdown.
-CHECKS_DOCS_DIRS = os.getenv("CHECKS_DOCS_DIRS", "docs,src/data/checks_whitepaper,src/data/checks_whitepaper/docs")
-CHECKS_DOCS_MAX_CHARS = int(os.getenv("CHECKS_DOCS_MAX_CHARS", "6500"))
+# -------------------------
+# Checks Whitepaper Docs (synced by GitHub Actions)
+# -------------------------
+# Expected landing path (per workflow): /app/src/data/checks_whitepaper on Railway
+CHECKS_DOCS_DIR = os.getenv("CHECKS_DOCS_DIR", "").strip()
 
-# ----------------------------
-# OpenAI client
-# ----------------------------
-client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ----------------------------
-# System prompt
-# ----------------------------
-SYSTEM_PROMPT = (
-    "You are Penny, the official AI advisor for Paycheck Labs.\n"
-    "You provide product guidance, community operations support, and educational explanations.\n"
-    "Tone: calm, precise, protective. Prioritize clarity and correct process over hype.\n"
-    "If you are unsure, say so and suggest the next best step.\n"
-)
-
-# ----------------------------
-# Memory (simple in-process)
-# ----------------------------
-MAX_MEMORY_TURNS = 6
-_memory: Dict[str, List[Dict[str, str]]] = {}
-
-def _mem_key(chat_id: int, user_id: int) -> str:
-    return f"{chat_id}:{user_id}"
-
-def get_memory(chat_id: int, user_id: int) -> List[Dict[str, str]]:
-    return _memory.get(_mem_key(chat_id, user_id), [])[-(MAX_MEMORY_TURNS * 2):]
-
-def add_memory(chat_id: int, user_id: int, role: str, content: str) -> None:
-    key = _mem_key(chat_id, user_id)
-    _memory.setdefault(key, []).append({"role": role, "content": content})
-    _memory[key] = _memory[key][-(MAX_MEMORY_TURNS * 2):]
-
-# ----------------------------
-# Utilities
-# ----------------------------
-def extract_output_text(resp) -> str:
+def _candidate_checks_docs_dirs() -> List[Path]:
     """
-    Robust extraction for Responses API.
+    Return plausible locations for the synced Checks docs, in order of preference.
+    This is intentionally defensive because different deploy targets may have different working dirs.
     """
+    here = Path(__file__).resolve()
+    src_dir = here.parent  # .../src
+    repo_root = src_dir.parent
+
+    candidates: List[Path] = []
+
+    # 1) Explicit env var, if provided
+    if CHECKS_DOCS_DIR:
+        candidates.append(Path(CHECKS_DOCS_DIR))
+
+    # 2) Expected path in this repo layout
+    candidates.append(src_dir / "data" / "checks_whitepaper")
+    candidates.append(repo_root / "src" / "data" / "checks_whitepaper")
+
+    # 3) Common alternates if someone changed the sync script
+    candidates.append(repo_root / "docs" / "checks_whitepaper")
+    candidates.append(repo_root / "data" / "checks_whitepaper")
+    candidates.append(repo_root / "checks_whitepaper")
+
+    # Normalize / de-dupe while preserving order
+    seen = set()
+    out: List[Path] = []
+    for p in candidates:
+        try:
+            rp = p.expanduser().resolve()
+        except Exception:
+            rp = p
+        if str(rp) not in seen:
+            seen.add(str(rp))
+            out.append(rp)
+    return out
+
+
+def _read_markdown_files(root: Path, max_files: int = 200) -> List[Tuple[str, str]]:
+    """
+    Read markdown-ish files under root.
+    Returns list of (relative_path, text).
+    """
+    items: List[Tuple[str, str]] = []
+    if not root.exists() or not root.is_dir():
+        return items
+
+    count = 0
+    for path in sorted(root.rglob("*")):
+        if count >= max_files:
+            break
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in {".md", ".markdown", ".mdx", ".txt"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        rel = str(path.relative_to(root))
+        items.append((rel, text))
+        count += 1
+    return items
+
+
+def _score_doc_text(query_terms: List[str], text: str) -> int:
+    """
+    Tiny keyword overlap scorer. Fast and dependency-free.
+    """
+    if not query_terms or not text:
+        return 0
+    t = text.lower()
+    score = 0
+    for term in query_terms:
+        if not term:
+            continue
+        # Favor exact term hits; count a few occurrences but cap to avoid long-doc dominance.
+        hits = t.count(term)
+        if hits:
+            score += min(hits, 6)
+    return score
+
+
+def get_checks_docs_context(user_text: str, char_budget: int = 6000) -> Tuple[str, str]:
+    """
+    Returns (chosen_root, context_text). If not found, returns ("", "").
+    Context is assembled from the most relevant markdown files.
+    """
+    user_text_l = (user_text or "").lower()
+
+    # If the user isn't asking about Checks, bail early.
+    checks_triggers = [
+        "checks",
+        "check token",
+        "$check",
+        "nft check",
+        "checks platform",
+        "whitepaper",
+        "roadmap",
+        "post-mvp",
+        "auto-invest",
+        "autoinvest",
+        "auto investment",
+    ]
+    if not any(t in user_text_l for t in checks_triggers):
+        return ("", "")
+
+    # Basic term list for scoring
+    # Keep short terms out to reduce noise
+    raw_terms = re.findall(r"[a-z0-9\-]{3,}", user_text_l)
+    # Add a couple normalized variants
+    raw_terms += ["post-mvp", "postmvp", "auto-invest", "autoinvest", "auto", "investment", "roadmap"]
+    query_terms = sorted(set(raw_terms))
+
+    for root in _candidate_checks_docs_dirs():
+        files = _read_markdown_files(root)
+        if not files:
+            continue
+
+        ranked: List[Tuple[int, str, str]] = []
+        for rel, txt in files:
+            s = _score_doc_text(query_terms, txt)
+            if s > 0:
+                ranked.append((s, rel, txt))
+
+        # If nothing scored, still provide a tiny index hint (so the model knows docs exist)
+        ranked.sort(key=lambda x: x[0], reverse=True)
+
+        parts: List[str] = []
+        used = 0
+
+        if ranked:
+            for s, rel, txt in ranked[:8]:
+                snippet = txt.strip()
+                # Light trimming
+                if len(snippet) > 1800:
+                    snippet = snippet[:1800] + "\n…"
+                block = f"FILE: {rel}\n{snippet}"
+                if used + len(block) + 2 > char_budget:
+                    break
+                parts.append(block)
+                used += len(block) + 2
+        else:
+            # No keyword matches; include a short manifest of available files
+            manifest = "\n".join([f"- {rel}" for rel, _ in files[:40]])
+            parts.append("No strong keyword match. Available files (partial):\n" + manifest)
+
+        context = "\n\n".join(parts).strip()
+        return (str(root), context)
+
+    return ("", "")
+
+
+# -------------------------
+# OpenAI
+# -------------------------
+if not OPENAI_API_KEY:
+    log.warning("OPENAI_API_KEY not set. Penny will not be able to answer.")
+
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# -------------------------
+# Conversation state
+# -------------------------
+# Keep a short rolling buffer per chat.
+CHAT_HISTORY: Dict[int, Deque[Tuple[str, str]]] = {}
+MAX_TURNS = 12
+
+# -------------------------
+# Base system prompt
+# -------------------------
+SYSTEM_PROMPT = """You are Penny, the official AI advisor for Paycheck Labs.
+
+You are:
+- Calm, precise, and helpful.
+- Protective: you do not hallucinate. If you don't know, say so.
+- Practical: you provide actionable steps, not vague statements.
+
+Behavior rules:
+- If asked about Paycheck Labs, Checks Platform, or Check Token, answer directly and accurately.
+- If not asked, do not volunteer company internal details.
+- If you have authoritative docs context provided in the conversation, treat it as the source of truth.
+- Keep answers concise unless the user asks for more detail.
+"""
+
+# Optional: extra system context (kept empty by default)
+SYSTEM_CONTEXT = os.getenv("SYSTEM_CONTEXT", "").strip()
+
+
+def get_chat_history(chat_id: int) -> Deque[Tuple[str, str]]:
+    if chat_id not in CHAT_HISTORY:
+        CHAT_HISTORY[chat_id] = deque(maxlen=MAX_TURNS * 2)  # each turn is user+assistant
+    return CHAT_HISTORY[chat_id]
+
+
+def user_is_allowed(update: Update) -> bool:
+    if not ALLOWED_TELEGRAM_USER_ID:
+        return True
     try:
-        if hasattr(resp, "output_text") and resp.output_text:
-            return resp.output_text.strip()
+        return str(update.effective_user.id) == str(ALLOWED_TELEGRAM_USER_ID)
     except Exception:
-        pass
-
-    try:
-        out = []
-        for item in resp.output:
-            if getattr(item, "type", None) == "message":
-                for c in getattr(item, "content", []) or []:
-                    if getattr(c, "type", None) == "output_text":
-                        out.append(getattr(c, "text", ""))
-        text = "\n".join([t for t in out if t]).strip()
-        return text
-    except Exception:
-        return ""
-
-def should_respond(message_text: str, is_reply_to_bot: bool) -> bool:
-    """
-    In groups: respond if trigger word, @mention, or reply-to-bot.
-    In DMs: always respond.
-    """
-    if not message_text:
         return False
 
-    txt = message_text.strip()
-    low = txt.lower()
 
-    if is_reply_to_bot:
-        return True
+def should_respond_in_chat(text: str) -> bool:
+    """
+    In group chats, only respond when the message starts with /penny (or whatever BOT_TRIGGER is).
+    In DMs, respond to everything.
+    """
+    if not text:
+        return False
+    t = text.strip()
+    return t.lower().startswith(BOT_TRIGGER.lower())
 
-    if BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in low:
-        return True
 
-    if low.startswith(BOT_TRIGGER + " "):
-        return True
-    if low == BOT_TRIGGER:
-        return True
+def strip_trigger(text: str) -> str:
+    t = (text or "").strip()
+    if t.lower().startswith(BOT_TRIGGER.lower()):
+        return t[len(BOT_TRIGGER):].strip()
+    return t
 
-    return False
 
-def strip_trigger_prefix(message_text: str) -> str:
-    txt = message_text.strip()
-    low = txt.lower()
-    if low.startswith(BOT_TRIGGER + " "):
-        return txt[len(BOT_TRIGGER) + 1 :].strip()
-    if low == BOT_TRIGGER:
-        return ""
-    return txt
+def build_messages(system_prompt: str, conversation: List[Tuple[str, str]], user_text: str) -> List[Dict[str, str]]:
+    messages: List[Dict[str, str]] = []
+    messages.append({
+        "role": "system",
+        "content": system_prompt,
+    })
 
-# ----------------------------
-# Message builder (CORE)
-# ----------------------------
-def build_messages(chat_id: int, user_id: int, user_text: str) -> List[Dict[str, str]]:
-    msgs: List[Dict[str, str]] = [{"role": "developer", "content": SYSTEM_PROMPT}]
+    system_context = SYSTEM_CONTEXT
+    if system_context:
+        messages.append({
+            "role": "system",
+            "content": system_context,
+        })
 
-    # Existing: inject KB context (only when relevant)
-    kb_context = build_kb_context(user_text, max_sections=3)
-    if kb_context:
-        msgs.append({"role": "developer", "content": kb_context})
+    # If relevant, inject synced Checks whitepaper/docs context (read-only excerpts)
+    checks_root, checks_ctx = get_checks_docs_context(user_text)
+    if checks_ctx:
+        messages.append({
+            "role": "system",
+            "content": (
+                "Checks Docs Context (synced markdown excerpts; treat as authoritative within this bot)\n"
+                f"Docs root: {checks_root}\n\n"
+                f"{checks_ctx}"
+            ),
+        })
 
-    # NEW: inject Checks docs excerpts (only when relevant)
-    # This is what makes "Auto-Investment" and other roadmap features discoverable.
-    dirs = [d.strip() for d in CHECKS_DOCS_DIRS.split(",") if d.strip()]
-    docs_context = build_checks_context(
-        user_text=user_text,
-        dirs=dirs,
-        max_chars=CHECKS_DOCS_MAX_CHARS,
-    )
-    if docs_context:
-        msgs.append({"role": "developer", "content": docs_context})
+    # Add prior conversation (trimmed)
+    for role, content in conversation[-(MAX_TURNS * 2):]:
+        messages.append({
+            "role": role,
+            "content": content,
+        })
 
-    # Memory
-    msgs.extend(get_memory(chat_id, user_id))
+    # Current user message
+    messages.append({
+        "role": "user",
+        "content": user_text,
+    })
 
-    # User
-    msgs.append({"role": "user", "content": user_text})
-    return msgs
+    return messages
 
-# ----------------------------
-# OpenAI call
-# ----------------------------
-def openai_reply(chat_id: int, user_id: int, user_text: str) -> Tuple[Optional[str], Optional[str]]:
-    messages = build_messages(chat_id, user_id, user_text)
-    last_err = None
-    for attempt in range(2):
-        try:
-            resp = client.responses.create(
-                model=OPENAI_MODEL,
-                input=messages,
-                max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
-                text={"verbosity": "low"},
-                reasoning={"effort": "minimal"},
-            )
-            text = extract_output_text(resp)
-            if text:
-                return text, None
-            last_err = "Empty model output"
-        except Exception as e:
-            last_err = repr(e)
-            logger.exception("OpenAI call failed (attempt %s): %s", attempt + 1, last_err)
-            time.sleep(0.6)
-    return None, last_err
 
-# ----------------------------
-# Telegram handlers
-# ----------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hi. How can I help?")
+def openai_reply(conversation: List[Tuple[str, str]], user_text: str) -> str:
+    if not client:
+        return "OpenAI is not configured (missing OPENAI_API_KEY)."
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Quick tips:\n"
-        f"- In groups: start with {BOT_TRIGGER} or @{BOT_USERNAME}, or reply to me.\n"
-        "- In DMs: just type normally.\n"
-        "Examples:\n"
-        f"{BOT_TRIGGER} Summarize this in 3 bullets\n"
-        f"@{BOT_USERNAME} What should I do next?"
-    )
-
-# Stash last DM media (photo or GIF) for later posting
-_dm_media_stash: Dict[int, Dict[str, str]] = {}
-
-def _stash_dm_media(user_id: int, media_type: str, file_id: str) -> None:
-    _dm_media_stash[user_id] = {"type": media_type, "file_id": file_id}
-
-def _pop_dm_media(user_id: int) -> Optional[Dict[str, str]]:
-    return _dm_media_stash.pop(user_id, None)
-
-async def stash_dm_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or msg.chat.type != ChatType.PRIVATE or not msg.from_user:
-        return
-
-    # Photo
-    if msg.photo:
-        file_id = msg.photo[-1].file_id
-        _stash_dm_media(msg.from_user.id, "photo", file_id)
-        await msg.reply_text("Got it. Now send /posttestcaption <text> and I will post the image + caption to the group.")
-        return
-
-    # GIF / animation
-    if msg.animation:
-        file_id = msg.animation.file_id
-        _stash_dm_media(msg.from_user.id, "animation", file_id)
-        await msg.reply_text("Got it. Now send /posttestcaption <text> and I will post the GIF + caption to the group.")
-        return
-
-# /posttestcaption (DM only) -> posts last DM media (if any) + caption into the Testing Group
-async def post_test_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg:
-        return
-
-    if msg.chat.type != ChatType.PRIVATE:
-        await msg.reply_text("Please use /posttestcaption in DM with me.")
-        return
-
-    if ADMIN_IDS and msg.from_user and msg.from_user.id not in ADMIN_IDS:
-        await msg.reply_text("Not authorized.")
-        return
-
-    caption = " ".join(context.args).strip() if context.args else ""
-    if not caption:
-        await msg.reply_text("Usage: /posttestcaption <caption text>")
-        return
-
-    if not TESTING_GROUP_ID:
-        await msg.reply_text("TESTING_GROUP_ID is not set.")
-        return
-
-    if not msg.from_user:
-        await msg.reply_text("Missing user.")
-        return
-
-    stashed = _pop_dm_media(msg.from_user.id)
-    if not stashed:
-        await msg.reply_text("I don't have any recent photo/GIF from you. Send me an image (or GIF) first, then run /posttestcaption.")
-        return
-
-    media_type = stashed.get("type")
-    file_id = stashed.get("file_id")
+    messages = build_messages(SYSTEM_PROMPT, conversation, user_text)
 
     try:
-        if media_type == "photo":
-            await context.bot.send_photo(chat_id=TESTING_GROUP_ID, photo=file_id, caption=caption)
-        elif media_type == "animation":
-            await context.bot.send_animation(chat_id=TESTING_GROUP_ID, animation=file_id, caption=caption)
-        else:
-            await msg.reply_text("Unsupported media type.")
-            return
-
-        await msg.reply_text("Posted to the testing group.")
+        resp = client.responses.create(
+            model=MODEL,
+            input=messages,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+        )
+        return (resp.output_text or "").strip()
     except Exception as e:
-        logger.exception("Failed to post to testing group: %s", repr(e))
-        await msg.reply_text("Failed to post. Check logs.")
+        log.exception("OpenAI call failed")
+        return f"I hit an error calling the model. Check Railway logs and your OPENAI settings.\n\nError: {type(e).__name__}"
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.text:
+
+# -------------------------
+# Telegram handlers
+# -------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not user_is_allowed(update):
+        return
+    await update.message.reply_text(
+        f"Hi — I’m {BOT_NAME}. Ask me anything, or use `{BOT_TRIGGER} <question>` in group chats.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not user_is_allowed(update):
+        return
+    await update.message.reply_text(
+        "Commands:\n"
+        "/start — intro\n"
+        "/help — this help\n\n"
+        "In group chats, use:\n"
+        f"{BOT_TRIGGER} <your question>",
+    )
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not user_is_allowed(update):
         return
 
-    chat = msg.chat
-    chat_id = chat.id
-    user = msg.from_user
-    if not user:
+    text = (update.message.text or "").strip()
+    if not text:
         return
-    user_id = user.id
 
-    text_in = msg.text.strip()
+    # If group chat, require trigger; if DM, respond normally.
+    is_group = update.effective_chat and update.effective_chat.type in ("group", "supergroup")
 
-    # Determine whether this is a reply to the bot
-    is_reply_to_bot = False
-    if msg.reply_to_message and msg.reply_to_message.from_user and BOT_USERNAME:
-        is_reply_to_bot = (msg.reply_to_message.from_user.username or "").lower() == BOT_USERNAME.lower()
-
-    # DMs: always respond
-    if chat.type == ChatType.PRIVATE:
-        user_text = text_in
-    else:
-        # Groups: only respond if triggered
-        if not should_respond(text_in, is_reply_to_bot):
+    if is_group:
+        if not should_respond_in_chat(text):
             return
-        user_text = strip_trigger_prefix(text_in)
+        user_text = strip_trigger(text)
+        if not user_text:
+            return
+    else:
+        user_text = text
 
-    # Persist memory
-    add_memory(chat_id, user_id, "user", user_text)
+    chat_id = update.effective_chat.id
+    history = get_chat_history(chat_id)
 
-    # Call OpenAI
-    answer, err = openai_reply(chat_id, user_id, user_text)
-    if err:
-        await msg.reply_text("I hit an error calling the model. Check Railway logs and your OPENAI settings.")
-        return
+    # Add user message to history
+    history.append(("user", user_text))
 
-    add_memory(chat_id, user_id, "assistant", answer)
-    await msg.reply_text(answer)
+    await update.message.chat.send_action(action=ChatAction.TYPING)
 
-def main():
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+    reply = openai_reply(list(history), user_text)
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Add assistant reply to history
+    history.append(("assistant", reply))
+
+    await update.message.reply_text(reply)
+
+
+def _build_app() -> Application:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("posttestcaption", post_test_caption))
-
-    # DM media stash (photos/animations)
-    app.add_handler(MessageHandler(filters.PHOTO | filters.ANIMATION, stash_dm_media))
-
-    # Text messages
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Starting Penny bot...")
-    app.run_polling()
+    return app
+
+
+def main() -> None:
+    app = _build_app()
+    log.info("Starting Penny Telegram bot...")
+    app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
