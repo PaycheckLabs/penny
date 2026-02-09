@@ -1,0 +1,62 @@
+name: Sync Checks Whitepaper
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Branch/tag/commit in PaycheckLabs/checks-gitbook (default: main)"
+        required: false
+        default: "main"
+  # This is ONLY to force GitHub to index the workflow and to allow quick retests
+  # It triggers only when THIS workflow file is changed (no spam).
+  push:
+    paths:
+      - ".github/workflows/sync-checks-whitepaper.yml"
+
+# Needed so the workflow can commit back into the penny repo
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout penny repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout checks-gitbook repo
+        uses: actions/checkout@v4
+        with:
+          repository: PaycheckLabs/checks-gitbook
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: _checks_gitbook
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Sync whitepaper markdown into penny
+        env:
+          WP_SRC_DIR: ${{ github.workspace }}/_checks_gitbook
+          WP_DEST_DIR: ${{ github.workspace }}/src/data/checks_whitepaper
+        run: |
+          python scripts/sync_whitepaper.py
+
+      - name: Commit changes (if any)
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git config user.name "penny-sync-bot"
+          git config user.email "penny-sync-bot@users.noreply.github.com"
+
+          git add src/data/checks_whitepaper
+          git commit -m "Sync Checks whitepaper content"
+          git push
