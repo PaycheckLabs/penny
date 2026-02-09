@@ -36,6 +36,12 @@ OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "260").stri
 BOT_USERNAME = os.getenv("BOT_USERNAME", "HeyPennyBot").strip().lstrip("@")
 BOT_TRIGGER = (os.getenv("BOT_TRIGGER") or os.getenv("COMMAND_TRIGGER") or "/penny").strip()
 
+# NEW INPUT 1: where the synced Checks whitepaper/docs live in this repo
+CHECKS_DOCS_DIR = os.getenv("CHECKS_DOCS_DIR", "docs/data/checks_whitepaper").strip()
+
+# NEW INPUT 2: how many KB sections to inject (keep small for token cost + relevance)
+CHECKS_KB_MAX_SECTIONS = int(os.getenv("CHECKS_KB_MAX_SECTIONS", "4").strip())
+
 def _parse_int_env(name: str, default: int = 0) -> int:
     raw = (os.getenv(name, "") or "").strip()
     if not raw:
@@ -189,7 +195,17 @@ def build_messages(chat_id: int, user_id: int, user_text: str) -> List[Dict[str,
     msgs: List[Dict[str, str]] = [{"role": "developer", "content": SYSTEM_PROMPT}]
 
     # NEW: inject KB context only when relevant
-    kb_context = build_kb_context(user_text, max_sections=3)
+    # We try calling build_kb_context with docs_dir if supported.
+    kb_context = ""
+    try:
+        kb_context = build_kb_context(user_text, docs_dir=CHECKS_DOCS_DIR, max_sections=CHECKS_KB_MAX_SECTIONS)
+    except TypeError:
+        # Fallback for older signature
+        kb_context = build_kb_context(user_text, max_sections=CHECKS_KB_MAX_SECTIONS)
+    except Exception as e:
+        logger.warning("KB context build failed: %r", e)
+        kb_context = ""
+
     if kb_context:
         msgs.append({"role": "developer", "content": kb_context})
 
@@ -329,14 +345,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = msg.from_user.id if msg.from_user else 0
 
     add_to_memory(chat_id, user_id, "user", user_text if user_text else raw_text)
+
     assistant_text, err = answer_openai_reply(
-    chat_id,
-    user_id,
-    user_text if user_text else raw_text,
-    client=client,
-    openai_model=OPENAI_MODEL,
-    build_messages=build_messages,
-)
+        chat_id,
+        user_id,
+        user_text if user_text else raw_text,
+        client=client,
+        openai_model=OPENAI_MODEL,
+        build_messages=build_messages,
+    )
 
     if assistant_text:
         add_to_memory(chat_id, user_id, "assistant", assistant_text)
