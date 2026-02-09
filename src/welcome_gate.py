@@ -43,6 +43,57 @@ WELCOME_GIF_LOCAL_PATH = os.getenv("WELCOME_GIF_LOCAL_PATH", "").strip()
 CB_VERIFY_PREFIX = "verify_gate:"
 CAPTCHA_ICONS: List[str] = ["✅", "⭐", "🔷", "🍀"]
 
+# -----------------------------
+# Optional allowlist / gating helpers (used by bot.py)
+# -----------------------------
+
+WELCOME_GATE_ENABLED = os.getenv("WELCOME_GATE_ENABLED", "false").lower() == "true"
+
+def _parse_id_set(env_name: str) -> set[int]:
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        return set()
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except Exception:
+            continue
+    return out
+
+ADMIN_USER_IDS = _parse_id_set("ADMIN_USER_IDS") or _parse_id_set("PENNY_ADMIN_USER_IDS")
+ALLOWED_USER_IDS = _parse_id_set("ALLOWED_USER_IDS")  # if set, only these users can use Penny
+
+def is_allowed_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Lightweight gate for Penny's AI responses.
+
+    - If ALLOWED_USER_IDS is set, only those IDs (plus admins) can use Penny.
+    - If WELCOME_GATE_ENABLED is true, users currently in the verification flow (PENDING) are blocked.
+    """
+    user = getattr(update, "effective_user", None)
+    chat = getattr(update, "effective_chat", None)
+    if not user or not chat:
+        return False
+
+    uid = int(user.id)
+
+    if uid in ADMIN_USER_IDS:
+        return True
+
+    if ALLOWED_USER_IDS and uid not in ALLOWED_USER_IDS:
+        return False
+
+    if WELCOME_GATE_ENABLED and chat.type in ("group", "supergroup"):
+        # If user is currently pending verification, block AI usage until verified.
+        if _key(chat.id, uid) in PENDING:
+            return False
+
+    return True
+
 # Anti-duplicate welcome window (seconds)
 WELCOME_DEDUP_SECONDS = int(os.getenv("WELCOME_DEDUP_SECONDS", "20"))
 
