@@ -1,12 +1,24 @@
-import os
-import time
-import json
-import logging
-import traceback
-from collections import defaultdict, deque
-from typing import Deque, Dict, List, Optional, Tuple
-from pathlib import Path
+#!/usr/bin/env python3
+"""
+Penny Telegram Bot (stable, minimal, and safe)
 
+Key goals:
+- Respond reliably in DMs, and in groups when invoked via /penny or @mention (or reply-to-bot).
+- Do NOT talk about Paycheck Labs / Checks unless the user asks about it.
+- When the user *does* ask about Paycheck Labs / Checks, attach synced docs context (via src/answer.py).
+- Avoid blocking the asyncio event loop: OpenAI calls run in a worker thread.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+from openai import OpenAI
 from telegram import Update
 from telegram.constants import ChatType
 from telegram.ext import (
@@ -17,368 +29,336 @@ from telegram.ext import (
     filters,
 )
 
-from openai import OpenAI
+# Local modules (in /src). Keep these imports simple so `python src/bot.py` works on Railway.
+try:
+    from answer import openai_reply as answer_openai_reply
+except Exception:
+    # Fallback for edge runtimes that run as a package (rare)
+    from src.answer import openai_reply as answer_openai_reply  # type: ignore
 
-from welcome_gate import is_allowed_user
-from knowledge_base import should_attach_kb_context, build_kb_context
-
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("penny-bot")
-
-# -----------------------------------------------------------------------------
-# Environment / Config
-# -----------------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
-OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "450").strip())
-
-# Optional: where the synced Checks docs/whitepaper markdown lives on disk
-CHECKS_DOCS_DIR = os.getenv("CHECKS_DOCS_DIR", "").strip()
-# Upper bound on how much doc text to inject per reply (keeps prompts small)
-CHECKS_DOCS_MAX_CHARS = int(os.getenv("CHECKS_DOCS_MAX_CHARS", "8000").strip())
-
-BOT_USERNAME = os.getenv("BOT_USERNAME", "@HeyPennyBot").strip()
-
-# Limits
-MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "12").strip())
-
-# -----------------------------------------------------------------------------
-# Validate required env
-# -----------------------------------------------------------------------------
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var.")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY env var.")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# -----------------------------------------------------------------------------
-# In-memory conversation store (per chat)
-# -----------------------------------------------------------------------------
-chat_history: Dict[int, Deque[Tuple[str, str]]] = defaultdict(lambda: deque(maxlen=MAX_HISTORY_TURNS))
-
-# -----------------------------------------------------------------------------
-# System prompt
-# -----------------------------------------------------------------------------
-SYSTEM_PROMPT = """You are Penny, the official AI advisor for Paycheck Labs.
-Your job is to provide product guidance, community operations help, and educational responses.
-
-Tone:
-- Calm, precise, helpful.
-- Clarity over hype.
-- If you are unsure, ask a short follow-up question.
-- If a user requests financial advice, do not give it. Offer general education and risk reminders.
-
-Rules:
-- Do not invent features or claim details are in docs unless you have them.
-- If you can’t find something in the synced docs context, say so plainly.
-"""
-
-# -----------------------------------------------------------------------------
-# Docs retrieval (best-effort local scan)
-# -----------------------------------------------------------------------------
-def _repo_root() -> Path:
-    # bot.py is in src/; repo root is one level up
-    return Path(__file__).resolve().parent.parent
+try:
+    from welcome_gate import is_allowed_user, register_welcome_gate_handlers
+except Exception:
+    from src.welcome_gate import is_allowed_user, register_welcome_gate_handlers  # type: ignore
 
 
-def _candidate_docs_dirs() -> list[Path]:
-    # 1) explicit env var
-    dirs: list[Path] = []
-    if CHECKS_DOCS_DIR:
-        dirs.append(Path(CHECKS_DOCS_DIR))
+logger = logging.getLogger("penny")
 
-    root = _repo_root()
-    # 2) common sync destinations (support both)
-    dirs.extend(
+# ---------- Config ----------
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or ""
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or os.getenv("api_key") or ""
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "550"))
+
+# Penny should be general by default. Product/company context is attached only when user asks.
+BASE_SYSTEM_PROMPT = os.getenv(
+    "PENNY_SYSTEM_PROMPT",
+    "\n".join(
         [
-            root / "src" / "data" / "checks_whitepaper",
-            root / "docs",
-            root / "src" / "docs",
+            "You are Penny, a friendly, capable AI assistant.",
+            "",
+            "Default behavior:",
+            "- Be general-purpose. Do NOT mention Paycheck Labs, Checks, or any products unless the user explicitly asks.",
+            "- Keep replies clear and complete (finish sentences).",
+            "- If the user greets you or asks small-talk, respond briefly and naturally.",
+            "",
+            "When the user asks about Paycheck Labs / Checks / the Checks whitepaper:",
+            "- Use any provided 'Synced docs context' if present.",
+            "- If the answer is not in the synced context, say so plainly rather than guessing.",
+            "",
+            "Safety and tone:",
+            "- Be helpful, calm, and precise.",
+            "- If something looks like sensitive info (keys, tokens, passwords), warn the user to rotate it and do not repeat it.",
         ]
-    )
+    ),
+)
 
-    # de-dupe, keep existing only
-    out: list[Path] = []
-    seen = set()
-    for d in dirs:
-        try:
-            d = d.resolve()
-        except Exception:
-            pass
-        if str(d) in seen:
-            continue
-        seen.add(str(d))
-        if d.exists() and d.is_dir():
-            out.append(d)
-    return out
+# ---------- Small-talk detection (avoid calling OpenAI for simple greetings) ----------
 
-
-def _read_markdown_files(base: Path) -> list[tuple[str, str]]:
-    """Return list of (path, text) for .md files under base."""
-    files: list[Path] = []
-    files.extend(sorted(base.glob("*.md")))
-    files.extend(sorted(base.rglob("*.md")))
-
-    seen = set()
-    out: list[tuple[str, str]] = []
-    for fp in files:
-        if not fp.is_file():
-            continue
-        try:
-            key = str(fp.resolve())
-        except Exception:
-            key = str(fp)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        try:
-            txt = fp.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            continue
-        if not txt.strip():
-            continue
-
-        # try to show a stable relative path for citations
-        try:
-            rel = str(fp.resolve().relative_to(_repo_root()))
-        except Exception:
-            rel = str(fp)
-        out.append((rel, txt))
-    return out
+GREETING_RE = re.compile(
+    r"^\s*(?:@?\w+\s*)?"
+    r"(?:hi|hello|hey|yo|gm|good\s+(?:morning|afternoon|evening)|sup|what'?s\s+up)"
+    r"(?:\s+penny\b)?"
+    r"[\s!?.]*$",
+    re.IGNORECASE,
+)
+THANKS_RE = re.compile(r"^\s*(thanks|thank\s+you|thx|ty)\b[\s!?.]*$", re.IGNORECASE)
+BYE_RE = re.compile(r"^\s*(bye|goodbye|later|cya|see\s+ya)\b[\s!?.]*$", re.IGNORECASE)
+HOW_ARE_YOU_RE = re.compile(r"^\s*(hi|hello|hey)\b.*\bhow\s+are\s+you\b.*$", re.IGNORECASE)
 
 
-def _tokenize(s: str) -> set[str]:
-    import re as _re
-
-    toks = _re.findall(r"[a-zA-Z0-9_\$]{2,}", s.lower())
-    stop = {
-        "the",
-        "and",
-        "for",
-        "with",
-        "that",
-        "this",
-        "from",
-        "into",
-        "your",
-        "you",
-        "are",
-        "was",
-        "were",
-        "what",
-        "when",
-        "where",
-        "how",
-        "why",
-        "can",
-        "could",
-        "should",
-        "would",
-        "about",
-        "onto",
-    }
-    return {t for t in toks if t not in stop}
+def _is_small_talk(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
+    if len(t) > 80:
+        return False
+    return bool(GREETING_RE.match(t) or THANKS_RE.match(t) or BYE_RE.match(t) or HOW_ARE_YOU_RE.match(t))
 
 
-def checks_docs_context(query: str) -> str:
-    """Best-effort retrieval from synced markdown docs. Returns a short context string."""
-    qset = _tokenize(query)
-    if not qset:
-        return ""
-
-    chunks: list[tuple[float, str]] = []  # (score, text)
-
-    for d in _candidate_docs_dirs():
-        for rel, txt in _read_markdown_files(d):
-            parts = [p.strip() for p in txt.split("\n\n") if p.strip()]
-            for p in parts:
-                pset = _tokenize(p)
-                if not pset:
-                    continue
-                overlap = len(qset & pset)
-                if overlap == 0:
-                    continue
-                boost = 1.5 if any(t in rel.lower() for t in qset) else 0.0
-                score = overlap + boost
-                snippet = f"[{rel}]\n{p}"
-                chunks.append((score, snippet))
-
-    if not chunks:
-        return ""
-
-    chunks.sort(key=lambda x: x[0], reverse=True)
-
-    out: list[str] = []
-    total = 0
-    for score, snippet in chunks[:40]:
-        if total >= CHECKS_DOCS_MAX_CHARS:
-            break
-        add = snippet + "\n---\n"
-        if total + len(add) > CHECKS_DOCS_MAX_CHARS and out:
-            break
-        out.append(add)
-        total += len(add)
-
-    return "".join(out).strip()
+def _small_talk_reply(text: str) -> str:
+    t = (text or "").lower()
+    if THANKS_RE.match(t):
+        return "You’re welcome. Want to keep going?"
+    if BYE_RE.match(t):
+        return "Catch you later."
+    if HOW_ARE_YOU_RE.match(t):
+        return "Doing great. How can I help you today?"
+    return "Hey. How can I help?"
 
 
-# -----------------------------------------------------------------------------
-# Message building + OpenAI call
-# -----------------------------------------------------------------------------
-def build_messages(chat_id: int, user_text: str) -> List[Dict[str, str]]:
-    msgs: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+# ---------- Conversation memory (in-memory) ----------
 
-    # Best-effort: inject relevant snippets from synced Checks docs/whitepaper
-    try:
-        ctx = checks_docs_context(user_text)
-    except Exception:
-        ctx = ""
+@dataclass
+class ConversationStore:
+    max_turns: int = 12  # user+assistant pairs
+    store: Dict[Tuple[int, int], List[Dict[str, str]]] = field(default_factory=dict)
 
-    if ctx:
-        msgs.insert(
-            0,
-            {
-                "role": "system",
-                "content": (
-                    "Use ONLY the following synced Checks docs excerpts as an authoritative source when answering questions about Checks.\n"
-                    "If the excerpts do not contain the answer, say you could not find it in the synced docs and ask a follow-up question.\n\n"
-                    f"{ctx}"
-                ),
-            },
-        )
+    def get(self, chat_id: int, user_id: int) -> List[Dict[str, str]]:
+        return list(self.store.get((chat_id, user_id), []))
 
-    # Attach KB context only when useful (your existing logic)
-    try:
-        if should_attach_kb_context(user_text):
-            kb_context = build_kb_context(user_text)
-            if kb_context:
-                msgs.append(
-                    {
-                        "role": "system",
-                        "content": f"Paycheck Labs internal context (use only if relevant):\n{kb_context}",
-                    }
-                )
-    except Exception:
-        pass
+    def append(self, chat_id: int, user_id: int, role: str, content: str) -> None:
+        key = (chat_id, user_id)
+        history = self.store.get(key, [])
+        history.append({"role": role, "content": content})
 
-    # Add history
-    for role, content in chat_history[chat_id]:
-        msgs.append({"role": role, "content": content})
-
-    # Add current user message
-    msgs.append({"role": "user", "content": user_text})
-    return msgs
+        # keep last N turns (2 messages per turn)
+        limit = self.max_turns * 2
+        if len(history) > limit:
+            history = history[-limit:]
+        self.store[key] = history
 
 
-def openai_reply(chat_id: int, user_text: str) -> str:
-    messages = build_messages(chat_id, user_text)
-
-    try:
-        resp = client.responses.create(
-            model=OPENAI_MODEL,
-            input=messages,
-            max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
-        )
-        out = (resp.output_text or "").strip()
-        return out if out else "I didn’t get a response back. Try again."
-    except Exception as e:
-        logger.error("OpenAI error: %s", e)
-        logger.error(traceback.format_exc())
-        return "I hit an error calling the model. Check Railway logs and your OPENAI settings."
+MEMORY = ConversationStore(max_turns=int(os.getenv("PENNY_MAX_TURNS", "12")))
 
 
-# -----------------------------------------------------------------------------
-# Handlers
-# -----------------------------------------------------------------------------
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ---------- Helpers ----------
+
+def _strip_invocation(text: str, bot_username: Optional[str]) -> str:
+    """Remove '/penny' prefix and @mentions to reduce prompt noise."""
+    t = (text or "").strip()
+
+    # Remove /penny at start
+    if t.lower().startswith("/penny"):
+        t = t[len("/penny") :].strip()
+
+    # Remove @BotUsername mention
+    if bot_username:
+        mention = "@" + bot_username.lower()
+        t = re.sub(rf"\s*{re.escape(mention)}\s*", " ", t, flags=re.IGNORECASE).strip()
+
+    # Remove leading 'penny,' or 'penny:' in groups
+    t = re.sub(r"^\s*penny\s*[:,\-]\s*", "", t, flags=re.IGNORECASE).strip()
+    return t
+
+
+async def _send_long(update: Update, text: str) -> None:
+    """Telegram hard limit is ~4096 chars; keep safe."""
     if not update.message:
         return
-    await update.message.reply_text("Hi — I’m Penny. Ask me anything about Paycheck Labs or Checks.")
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    msg = text or ""
+    if len(msg) <= 3500:
+        await update.message.reply_text(msg)
         return
-    await update.message.reply_text(
-        "Commands:\n"
-        "/start — start\n"
-        "/help — help\n\n"
-        "You can also just message me normally."
-    )
+
+    chunk = []
+    size = 0
+    for line in msg.splitlines(keepends=True):
+        if size + len(line) > 3500 and chunk:
+            await update.message.reply_text("".join(chunk))
+            chunk, size = [], 0
+        chunk.append(line)
+        size += len(line)
+    if chunk:
+        await update.message.reply_text("".join(chunk))
 
 
-def _should_respond_in_group(update: Update) -> bool:
-    """Respond in groups only when directly mentioned or replied-to, to avoid spam."""
-    if not update.message:
+def _should_handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    msg = update.message
+    if not msg or not msg.text:
         return False
 
-    text = update.message.text or ""
-    # If user replied to bot
-    if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        if update.message.reply_to_message.from_user.username:
-            if update.message.reply_to_message.from_user.username.lower() in (BOT_USERNAME or "").lower():
+    # Trigger 1: message is a reply to the bot
+    if msg.reply_to_message and msg.reply_to_message.from_user and context.bot:
+        try:
+            if msg.reply_to_message.from_user.id == context.bot.id:
                 return True
-        # Some bots may not have username populated; allow reply anyway
+        except Exception:
+            pass
+
+    text_lower = msg.text.lower()
+
+    # Trigger 2: explicit @mention
+    try:
+        username = (context.bot.username or "").lower()
+    except Exception:
+        username = ""
+    if username and ("@" + username) in text_lower:
         return True
 
-    # If bot username mentioned
-    if BOT_USERNAME and BOT_USERNAME.lower() in text.lower():
-        return True
-
+    # Trigger 3: /penny command is handled by CommandHandler
     return False
 
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ---------- Handlers ----------
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    await update.message.reply_text("Hey, I’m Penny. Ask me anything.")
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    await update.message.reply_text(
+        "\n".join(
+            [
+                "How to use Penny:",
+                "- DM me with a question.",
+                "- In groups: use /penny <your question> or @mention me.",
+                "",
+                "Tip: I won’t talk about Paycheck Labs / Checks unless you ask.",
+            ]
+        )
+    )
+
+
+async def cmd_penny(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group-friendly command: /penny <question>"""
     if not update.message:
         return
 
-    # Gatekeeping (your existing allowlist logic)
-    if not is_allowed_user(update):
+    if not is_allowed_user(update, context):
+        # Gate messaging is handled by welcome_gate; keep this quiet.
         return
 
-    chat_id = update.effective_chat.id if update.effective_chat else 0
-    chat_type = update.effective_chat.type if update.effective_chat else None
-
-    user_text = (update.message.text or "").strip()
+    user_text = " ".join(context.args or []).strip()
     if not user_text:
+        await update.message.reply_text("Yep. What can I help with?")
         return
 
-    # Group handling: only respond when mentioned/replied to
+    await _handle_user_text(update, context, user_text)
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    if not msg or not msg.text:
+        return
+
+    if not is_allowed_user(update, context):
+        return
+
+    chat_type = msg.chat.type
+
+    # Private chats: always handle.
+    if chat_type == ChatType.PRIVATE:
+        user_text = msg.text.strip()
+        await _handle_user_text(update, context, user_text)
+        return
+
+    # Groups: handle only if invoked
     if chat_type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        if not _should_respond_in_group(update):
+        if not _should_handle_group_message(update, context):
             return
 
-    # Store user message in history
-    chat_history[chat_id].append(("user", user_text))
+        bot_username = (context.bot.username or "") if context.bot else ""
+        user_text = _strip_invocation(msg.text, bot_username).strip()
+        if not user_text:
+            await msg.reply_text("Yep. What can I help with?")
+            return
+        await _handle_user_text(update, context, user_text)
+        return
 
-    # Get reply
-    reply = openai_reply(chat_id, user_text)
 
-    # Store assistant reply in history
-    chat_history[chat_id].append(("assistant", reply))
+async def _handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str) -> None:
+    msg = update.message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not msg or not user or not chat:
+        return
 
-    await update.message.reply_text(reply)
+    bot_username = (context.bot.username or "") if context.bot else ""
+    user_text = _strip_invocation(raw_text, bot_username).strip()
 
+    # If it's simple small-talk, don't call OpenAI (and don't inject company context).
+    if _is_small_talk(user_text):
+        await _send_long(update, _small_talk_reply(user_text))
+        return
+
+    # Conversation history
+    history = MEMORY.get(chat.id, user.id)
+    MEMORY.append(chat.id, user.id, "user", user_text)
+
+    # OpenAI call (off the event loop)
+    try:
+        client = context.bot_data.get("openai_client")
+        if client is None:
+            raise RuntimeError("OpenAI client not initialized")
+
+        model = context.bot_data.get("openai_model", OPENAI_MODEL)
+        max_tokens = context.bot_data.get("openai_max_output_tokens", OPENAI_MAX_OUTPUT_TOKENS)
+        system_prompt = context.bot_data.get("system_prompt", BASE_SYSTEM_PROMPT)
+
+        reply_text = await asyncio.to_thread(
+            answer_openai_reply,
+            client,
+            system_prompt,
+            history,
+            user_text,
+            model,
+            max_tokens,
+        )
+
+        reply_text = (reply_text or "").strip()
+        if not reply_text:
+            reply_text = "I didn’t get a response back. Try again."
+
+    except Exception as e:
+        logger.exception("OpenAI reply failed: %s", e)
+        reply_text = "Oops. I hit a technical issue. Please try again in a moment."
+
+    MEMORY.append(chat.id, user.id, "assistant", reply_text)
+    await _send_long(update, reply_text)
+
+
+# ---------- Startup ----------
 
 def main() -> None:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY")
+
+    openai_client = OpenAI(api_key=OPENAI_API_KEY, timeout=35.0)
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
+    # store shared config
+    app.bot_data["openai_client"] = openai_client
+    app.bot_data["openai_model"] = OPENAI_MODEL
+    app.bot_data["openai_max_output_tokens"] = OPENAI_MAX_OUTPUT_TOKENS
+    app.bot_data["system_prompt"] = BASE_SYSTEM_PROMPT
 
+    # core commands
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("penny", cmd_penny))
+
+    # welcome gate (optional)
+    register_welcome_gate_handlers(app)
+
+    # text handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    logger.info("Penny bot starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Penny starting…")
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
