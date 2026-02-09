@@ -1,59 +1,74 @@
-import os
-from typing import Optional, List, Dict
+# src/answer.py
+from __future__ import annotations
 
-from openai import OpenAI
-
-from src.checks_rag import retrieve_checks_context, format_context_for_prompt
-
-client = OpenAI()
-
-PENNY_MODEL = os.getenv("PENNY_MODEL", "gpt-4o-mini")
-CHECKS_TOP_K = int(os.getenv("CHECKS_TOP_K", "6"))
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-def _system_prompt() -> str:
-    return (
-        "You are Penny, the official AI advisor for Paycheck Labs.\n\n"
-        "If the question is about Checks, the Checks Platform, NFT Checks, Check Token ($CHECK), "
-        "tokenomics, MVP features, or anything that sounds like the Checks whitepaper, use the "
-        "WHITEPAPER CONTEXT provided.\n\n"
-        "Rules:\n"
-        "- Answer clearly and directly.\n"
-        "- If you use facts from the context, cite them like [WP1], [WP2], etc.\n"
-        "- If the context does not contain the answer, say you're not sure and ask 1 short follow-up question.\n"
-        "- Do not paste long excerpts from the whitepaper.\n"
-    )
+def _extract_output_text(resp: Any) -> str:
+    """Best-effort extraction across OpenAI SDK response shapes."""
+    # New Responses API shape
+    if hasattr(resp, "output_text") and isinstance(getattr(resp, "output_text"), str):
+        return resp.output_text.strip()
+
+    # Chat Completions shape
+    try:
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        pass
+
+    # Fallback: try output[0].content[0].text
+    try:
+        out0 = resp.output[0]
+        c0 = out0.content[0]
+        if hasattr(c0, "text"):
+            return str(c0.text).strip()
+    except Exception:
+        pass
+
+    return ""
 
 
-def generate_penny_reply(user_text: str, chat_history: Optional[List[Dict[str, str]]] = None) -> str:
-    chunks = retrieve_checks_context(user_text, top_k=CHECKS_TOP_K)
-    whitepaper_context = format_context_for_prompt(chunks)
+def openai_reply(
+    chat_id: int,
+    user_id: int,
+    user_text: str,
+    *,
+    client: Any,
+    openai_model: str,
+    build_messages: Callable[[int, int, str], List[Dict[str, str]]],
+    max_retries: int = 2,
+) -> Tuple[str, Optional[str]]:
+    """Call OpenAI and return (assistant_text, error_string_or_None)."""
 
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": _system_prompt()},
-    ]
+    if not user_text:
+        return "", None
 
-    if chat_history:
-        for m in chat_history[-6:]:
-            role = m.get("role")
-            content = m.get("content")
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
+    messages = build_messages(chat_id, user_id, user_text)
 
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                f"WHITEPAPER CONTEXT:\n{whitepaper_context}\n\n"
-                f"USER QUESTION:\n{user_text}\n"
-            ),
-        }
-    )
+    last_err: Optional[str] = None
+    for attempt in range(max_retries + 1):
+        try:
+            # Prefer the Responses API when available
+            if hasattr(client, "responses") and hasattr(client.responses, "create"):
+                resp = client.responses.create(
+                    model=openai_model,
+                    input=messages,
+                )
+                return _extract_output_text(resp), None
 
-    resp = client.chat.completions.create(
-        model=PENNY_MODEL,
-        messages=messages,
-        temperature=float(os.getenv("PENNY_TEMPERATURE", "0.4")),
-    )
+            # Fallback: Chat Completions
+            resp = client.chat.completions.create(
+                model=openai_model,
+                messages=messages,
+            )
+            return _extract_output_text(resp), None
 
-    return resp.choices[0].message.content.strip()
+        except Exception as e:
+            last_err = str(e)
+            if attempt < max_retries:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            return "", last_err
+
+    return "", last_err
