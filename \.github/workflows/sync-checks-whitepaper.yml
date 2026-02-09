@@ -7,10 +7,13 @@ on:
         description: "Branch/tag/commit in PaycheckLabs/checks-gitbook (default: main)"
         required: false
         default: "main"
-  # Optional weekly auto-sync (remove if you only want manual)
-  schedule:
-    - cron: "0 9 * * 1"  # every Monday 09:00 UTC
+  # This is ONLY to force GitHub to index the workflow and to allow quick retests
+  # It triggers only when THIS workflow file is changed (no spam).
+  push:
+    paths:
+      - ".github/workflows/sync-checks-whitepaper.yml"
 
+# Needed so the workflow can commit back into the penny repo
 permissions:
   contents: write
 
