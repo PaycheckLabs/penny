@@ -47,7 +47,6 @@ def fetch_quote(symbol: str, convert: str = "USD", timeout: float = 10.0) -> dic
     req = urllib.request.Request(url)
     req.add_header("Accept", "application/json")
     req.add_header("X-CMC_PRO_API_KEY", _get_api_key())
-    req.add_header("Accept-Encoding", "gzip, deflate")
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
