@@ -41,6 +41,15 @@ try:
 except Exception:
     from src.welcome_gate import is_allowed_user, register_welcome_gate_handlers  # type: ignore
 
+# -------------------------------------------------------------------
+# NEW: CMC price module (safe import pattern, does not affect anything
+# unless /price is used)
+# -------------------------------------------------------------------
+try:
+    from price_cmc import get_price_line as cmc_get_price_line, CMCError
+except Exception:
+    from src.price_cmc import get_price_line as cmc_get_price_line, CMCError  # type: ignore
+
 
 logger = logging.getLogger("penny")
 
@@ -225,6 +234,38 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# -------------------------------------------------------------------
+# NEW: /price command (isolated; does not affect any other flow)
+# Usage:
+#   /price BTC
+#   /price BTC USD
+# -------------------------------------------------------------------
+async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    if not is_allowed_user(update, context):
+        # Keep consistent with your other commands
+        return
+
+    args = list(context.args or [])
+    if not args:
+        await update.message.reply_text("Usage: /price BTC  (or: /price BTC USD)")
+        return
+
+    symbol = (args[0] or "").strip().upper()
+    convert = (args[1] if len(args) > 1 else "USD").strip().upper()
+
+    try:
+        line = await asyncio.to_thread(cmc_get_price_line, symbol, convert)
+        await _send_long(update, line)
+    except CMCError as e:
+        await update.message.reply_text(f"Price error: {e}")
+    except Exception as e:
+        logger.exception("Price lookup failed: %s", e)
+        await update.message.reply_text("Oops. Price lookup failed. Try again in a moment.")
+
+
 async def cmd_penny(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Group-friendly command: /penny <question>"""
     if not update.message:
@@ -350,6 +391,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("penny", cmd_penny))
+    app.add_handler(CommandHandler("price", cmd_price))  # NEW
 
     # welcome gate (optional)
     register_welcome_gate_handlers(app)
